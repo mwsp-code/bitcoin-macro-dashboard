@@ -50,12 +50,20 @@ It separates the analysis into two layers:
 
 ## Mainland China VPN / Proxy Setup
 
-Crypto APIs and some market data sources may be blocked or unreliable from Mainland China without a VPN or proxy.
+Crypto APIs and some market data sources may be blocked or unreliable from Mainland China without a VPN or proxy. The app keeps proxy usage off by default so it can run on Streamlit Cloud, where `127.0.0.1:7890` would not point to your local VPN.
 
-The script supports a local HTTP proxy through:
+For local use in Mainland China, enable your VPN/proxy and set an environment variable before running Streamlit:
 
-```python
-PROXY_PORT = 7890
+```bash
+set BTC_PROXY_PORT=7890
+streamlit run btc_macro_htx.py
+```
+
+On PowerShell:
+
+```powershell
+$env:BTC_PROXY_PORT="7890"
+streamlit run btc_macro_htx.py
 ```
 
 Common proxy ports:
@@ -64,11 +72,9 @@ Common proxy ports:
 - V2Ray: `10809`
 - Shadowsocks: `1080`
 
-Set `PROXY_PORT` to match your local VPN/proxy tool. If you are outside Mainland China or do not need a proxy, set:
+Set `BTC_PROXY_PORT` to match your local VPN/proxy tool. If you are outside Mainland China, deploying on Streamlit Cloud, or do not need a proxy, leave `BTC_PROXY_PORT` unset.
 
-```python
-PROXY_PORT = None
-```
+For Streamlit Cloud deployment, do not set `BTC_PROXY_PORT` unless your cloud environment provides a reachable proxy.
 
 ## Installation
 

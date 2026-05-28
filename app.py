@@ -21,14 +21,24 @@ REOPTIMIZE_EVERY_DAYS = 7
 REQUIRED_COLS = ["BTC", "NASDAQ", "DXY", "GOLD", "OIL", "REAL_YIELD"]
 
 # ── PROXY CONFIG (required for mainland China) ───────────────────────────────
-# All crypto APIs are blocked by GFW. Requests must go through your local
-# VPN proxy (Clash / V2Ray / Shadowsocks etc).
-# Set PROXY_PORT to match your VPN tool:
-#   Clash:       7890  (default)
-#   V2Ray:       10809 (default)
-#   Shadowsocks: 1080  (default)
-# Set PROXY_PORT = None to attempt direct connection (will timeout in China).
-PROXY_PORT = 7890
+# Proxy is optional. Streamlit Cloud cannot reach your local 127.0.0.1 proxy,
+# so keep it off by default and enable it only in local environments that need it.
+def get_proxy_port():
+    raw = os.environ.get("BTC_PROXY_PORT") or os.environ.get("PROXY_PORT")
+    if raw is None:
+        try:
+            raw = st.secrets.get("BTC_PROXY_PORT")
+        except Exception:
+            raw = None
+    if raw in (None, "", "0", "none", "None", "false", "False"):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+PROXY_PORT = get_proxy_port()
 
 SESSION = requests.Session()
 SESSION.trust_env = False   # ignore broken system proxy env vars

@@ -4,14 +4,17 @@ import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
+from contextlib import contextmanager
 from datetime import datetime
 from itertools import product
 import requests
 import os
 import sys
 import time
+from pathlib import Path
 
-CACHE_FILE    = "backup_data.csv"
+BASE_DIR      = Path(__file__).resolve().parent
+CACHE_FILE    = BASE_DIR / "backup_data.csv"
 CACHE_MAX_AGE = 23   # hours
 TRADING_DAYS_PER_YEAR = 365
 WALK_FORWARD_MIN_TRAIN = 365
@@ -19,6 +22,7 @@ WALK_FORWARD_WINDOW = 730
 ALPHA_MIN_TRAIN = 180
 REOPTIMIZE_EVERY_DAYS = 7
 REQUIRED_COLS = ["BTC", "NASDAQ", "DXY", "GOLD", "OIL", "REAL_YIELD"]
+YFINANCE_TICKERS = [("QQQ", "NASDAQ"), ("DX-Y.NYB", "DXY"), ("GC=F", "GOLD"), ("CL=F", "OIL")]
 
 # ── PROXY CONFIG (required for mainland China) ───────────────────────────────
 # Proxy is optional. Streamlit Cloud cannot reach your local 127.0.0.1 proxy,
@@ -61,6 +65,20 @@ transaction_cost_bps = st.sidebar.number_input(
     value=10.0,
     step=1.0,
 )
+show_timing = st.sidebar.checkbox("Show timing", value=False)
+
+
+@contextmanager
+def timed(label, timings=None):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - start
+        if timings is not None:
+            timings[label] = elapsed
+        elif show_timing:
+            st.sidebar.write(f"{label}: {elapsed:.2f}s")
 
 if manual_refresh:
     st.cache_data.clear()
@@ -222,41 +240,94 @@ def normalize_daily_index(index):
     return idx.normalize()
 
 
-def load_macro_yfinance(ticker, name):
+def restore_env_var(name, old_value):
+    if old_value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = old_value
+
+
+def extract_yfinance_close(raw, ticker):
+    if raw is None or raw.empty:
+        return None
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        if ticker in raw.columns.get_level_values(0):
+            frame = raw[ticker]
+        elif ticker in raw.columns.get_level_values(-1):
+            frame = raw.xs(ticker, axis=1, level=-1)
+        else:
+            return None
+    else:
+        frame = raw
+
+    if "Close" not in frame.columns:
+        return None
+
+    close = frame["Close"].dropna().squeeze()
+    if isinstance(close, pd.DataFrame):
+        close = close.iloc[:, 0]
+    if close.empty:
+        return None
+
+    close.index = normalize_daily_index(close.index)
+    close = close[~close.index.duplicated(keep="last")]
+    return close.astype(float)
+
+
+def load_macro_yfinance_batch(start_date):
     """
-    Download a macro series via yfinance.
-    New yfinance uses curl_cffi internally and no longer accepts a
-    requests.Session. Instead we set HTTP_PROXY / HTTPS_PROXY env vars
-    before the call — curl_cffi picks these up automatically — then
-    restore the original values so SESSION behaviour is unaffected.
+    Download all macro series in one threaded yfinance request.
+    yfinance uses curl_cffi internally, so proxy settings are applied through
+    temporary HTTP_PROXY / HTTPS_PROXY env vars and then restored.
     """
+    statuses = {}
+    series_by_name = {}
+    timestamps = {}
+
     if not YFINANCE_AVAILABLE:
-        return None, "yfinance not installed — run: pip install yfinance", None
+        msg = "yfinance not installed — run: pip install yfinance"
+        return series_by_name, {name: msg for _, name in YFINANCE_TICKERS}, timestamps
+
     try:
-        # Temporarily set proxy env vars for curl_cffi
         proxy_url = f"http://127.0.0.1:{PROXY_PORT}" if PROXY_PORT else ""
-        old_http  = os.environ.get("HTTP_PROXY", "")
-        old_https = os.environ.get("HTTPS_PROXY", "")
+        old_http = os.environ.get("HTTP_PROXY")
+        old_https = os.environ.get("HTTPS_PROXY")
         if proxy_url:
-            os.environ["HTTP_PROXY"]  = proxy_url
+            os.environ["HTTP_PROXY"] = proxy_url
             os.environ["HTTPS_PROXY"] = proxy_url
 
         try:
-            tk = yf.Ticker(ticker)   # no session= — let yfinance handle it
-            df = tk.history(period="max", interval="1d", auto_adjust=True)
+            raw = yf.download(
+                [ticker for ticker, _ in YFINANCE_TICKERS],
+                start=pd.Timestamp(start_date).strftime("%Y-%m-%d"),
+                interval="1d",
+                auto_adjust=True,
+                threads=True,
+                progress=False,
+                timeout=10,
+                group_by="ticker",
+            )
         finally:
-            # Always restore original env vars
-            os.environ["HTTP_PROXY"]  = old_http
-            os.environ["HTTPS_PROXY"] = old_https
+            restore_env_var("HTTP_PROXY", old_http)
+            restore_env_var("HTTPS_PROXY", old_https)
 
-        if df.empty:
-            return None, "empty response", None
-        close = df["Close"].squeeze()
-        close.index = normalize_daily_index(close.index)
-        close = close[~close.index.duplicated(keep="last")]
-        return close.rename(name).astype(float), "live", close.index[-1]
+        if raw is None or raw.empty:
+            return series_by_name, {name: "empty response" for _, name in YFINANCE_TICKERS}, timestamps
+
+        for ticker, name in YFINANCE_TICKERS:
+            close = extract_yfinance_close(raw, ticker)
+            if close is None or close.empty:
+                statuses[name] = "empty response"
+                continue
+            series_by_name[name] = close.rename(name)
+            statuses[name] = "live"
+            timestamps[name] = close.index[-1]
+
+        return series_by_name, statuses, timestamps
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}", None
+        msg = f"{type(e).__name__}: {e}"
+        return series_by_name, {name: msg for _, name in YFINANCE_TICKERS}, timestamps
 
 # ─────────────────────────────────────────────
 # MAIN DATA LOADER
@@ -298,13 +369,13 @@ def load_data(force_refresh=False):
         if btc_errors:
             status["_btc_errors"] = "\n".join([f"  • {s}: {m}" for s, m in btc_errors.items()])
 
-    # ── MACRO (yfinance via proxy) ───────────
-    for ticker, name in [("QQQ","NASDAQ"), ("DX-Y.NYB","DXY"), ("GC=F","GOLD"), ("CL=F","OIL")]:
-        series, stat, ts = load_macro_yfinance(ticker, name)
-        status[name] = stat
-        if series is not None:
-            data[name] = series
-            timestamps[name] = ts
+    # ── MACRO (batched yfinance via proxy) ───
+    macro_start = data["BTC"].index.min()
+    macro_series, macro_status, macro_timestamps = load_macro_yfinance_batch(macro_start)
+    status.update(macro_status)
+    timestamps.update(macro_timestamps)
+    for name, series in macro_series.items():
+        data[name] = series
 
     # ── FRED REAL YIELD ──────────────────────
     try:
@@ -367,7 +438,11 @@ def load_data(force_refresh=False):
 
     return data, status, timestamps
 
-data, status, timestamps = load_data(force_refresh=manual_refresh)
+if show_timing:
+    st.sidebar.write("### Timing")
+
+with timed("load_data"):
+    data, status, timestamps = load_data(force_refresh=manual_refresh)
 st.sidebar.write("### 🧪 Index Debug")
 
 for col in data.columns:
@@ -436,6 +511,25 @@ def annualized_sharpe(ret):
     return np.sqrt(TRADING_DAYS_PER_YEAR) * ret.mean() / ret.std()
 
 
+def annualized_sharpe_array(ret):
+    ret = np.asarray(ret, dtype=float)
+    ret = ret[np.isfinite(ret)]
+    if ret.size < 2:
+        return np.nan
+    std = ret.std(ddof=1)
+    if std == 0:
+        return np.nan
+    return np.sqrt(TRADING_DAYS_PER_YEAR) * ret.mean() / std
+
+
+def strategy_returns_from_score_array(score, target, buy_threshold, sell_threshold, cost_rate):
+    score = np.asarray(score, dtype=float)
+    target = np.asarray(target, dtype=float)
+    position = np.select([score >= buy_threshold, score <= sell_threshold], [1.0, -1.0], default=0.0)
+    turnover = np.abs(np.diff(position, prepend=0.0))
+    return position * target - turnover * cost_rate
+
+
 def max_drawdown(equity):
     if equity.empty:
         return np.nan
@@ -460,18 +554,25 @@ def walk_forward_linear_model(features, target, min_train, train_window):
     frame = features.join(target.rename("target")).dropna()
     x = frame[features.columns]
     y_target = frame["target"]
-    predictions = pd.Series(np.nan, index=features.index, name="Walk-Forward Prediction")
-    coefs = pd.DataFrame(np.nan, index=features.index, columns=features.columns)
+    x_values = x.to_numpy(dtype=float)
+    y_values = y_target.to_numpy(dtype=float)
+    prediction_values = np.full(len(features.index), np.nan)
+    coef_values = np.full((len(features.index), len(features.columns)), np.nan)
+    output_locs = features.index.get_indexer(x.index)
 
     for i in range(min_train, len(frame)):
         start = max(0, i - train_window) if train_window else 0
-        x_train = x.iloc[start:i]
-        y_train = y_target.iloc[start:i]
-        model = LinearRegression().fit(x_train, y_train)
-        idx = x.index[i]
-        predictions.loc[idx] = model.predict(x.iloc[[i]])[0]
-        coefs.loc[idx] = model.coef_
+        x_train = x_values[start:i]
+        y_train = y_values[start:i]
+        design = np.column_stack([np.ones(len(x_train)), x_train])
+        beta, *_ = np.linalg.lstsq(design, y_train, rcond=None)
+        out_pos = output_locs[i]
+        if out_pos >= 0:
+            prediction_values[out_pos] = np.r_[1.0, x_values[i]] @ beta
+            coef_values[out_pos] = beta[1:]
 
+    predictions = pd.Series(prediction_values, index=features.index, name="Walk-Forward Prediction")
+    coefs = pd.DataFrame(coef_values, index=features.index, columns=features.columns)
     return predictions, coefs
 
 
@@ -495,38 +596,72 @@ def strategy_returns_from_score(score, target, buy_threshold, sell_threshold, co
     return position * target - turnover * cost_rate
 
 
+def optimize_weights_for_sharpe_array(matrix, target_values, candidates, cost_rate):
+    candidates = np.asarray(candidates, dtype=float)
+    target_values = np.asarray(target_values, dtype=float)
+    if candidates.size == 0:
+        raise ValueError("No weight candidates available.")
+
+    scores = np.clip(50 + 12.5 * (matrix @ candidates.T), 0, 100)
+    positions = np.where(scores >= 65, 1.0, np.where(scores <= 35, -1.0, 0.0))
+    turnovers = np.abs(np.diff(positions, axis=0, prepend=np.zeros((1, positions.shape[1]))))
+    returns = positions * target_values[:, None] - turnovers * cost_rate
+
+    means = returns.mean(axis=0)
+    stds = returns.std(axis=0, ddof=1)
+    sharpes = np.full(len(candidates), -np.inf)
+    valid = stds > 0
+    sharpes[valid] = np.sqrt(TRADING_DAYS_PER_YEAR) * means[valid] / stds[valid]
+
+    best_idx = int(np.argmax(sharpes))
+    best_sharpe = sharpes[best_idx]
+    if not np.isfinite(best_sharpe):
+        best_sharpe = np.nan
+    return candidates[best_idx], best_sharpe
+
+
 def optimize_weights_for_sharpe(components, target, candidates, cost_rate):
-    best_weights = candidates[0]
-    best_sharpe = -np.inf
-    matrix = components.to_numpy(dtype=float)
-    for weights in candidates:
-        score = pd.Series((50 + 12.5 * (matrix @ weights)).clip(0, 100), index=components.index)
-        ret = strategy_returns_from_score(score, target, 65, 35, cost_rate)
-        sharpe = annualized_sharpe(ret)
-        if not pd.isna(sharpe) and sharpe > best_sharpe:
-            best_sharpe = sharpe
-            best_weights = weights
+    best_weights, best_sharpe = optimize_weights_for_sharpe_array(
+        components.to_numpy(dtype=float),
+        target.to_numpy(dtype=float),
+        candidates,
+        cost_rate,
+    )
     return pd.Series(best_weights, index=components.columns), best_sharpe
 
 
-def optimize_thresholds_for_sharpe(score, target, cost_rate):
+def optimize_thresholds_for_sharpe_array(score, target_values, cost_rate):
     best_buy, best_sell, best_sharpe = 65, 35, -np.inf
     for buy_threshold in range(55, 81, 5):
         for sell_threshold in range(20, 46, 5):
             if sell_threshold >= buy_threshold:
                 continue
-            ret = strategy_returns_from_score(score, target, buy_threshold, sell_threshold, cost_rate)
-            sharpe = annualized_sharpe(ret)
+            ret = strategy_returns_from_score_array(score, target_values, buy_threshold, sell_threshold, cost_rate)
+            sharpe = annualized_sharpe_array(ret)
             if not pd.isna(sharpe) and sharpe > best_sharpe:
                 best_buy, best_sell, best_sharpe = buy_threshold, sell_threshold, sharpe
     return best_buy, best_sell, best_sharpe
 
 
+def optimize_thresholds_for_sharpe(score, target, cost_rate):
+    return optimize_thresholds_for_sharpe_array(
+        score.to_numpy(dtype=float),
+        target.to_numpy(dtype=float),
+        cost_rate,
+    )
+
+
 def build_walk_forward_alpha_signal(components, target, cost_rate):
     frame = components.join(target.rename("target")).dropna()
+    component_cols = list(components.columns)
+    component_matrix = frame[component_cols].to_numpy(dtype=float)
+    target_values = frame["target"].to_numpy(dtype=float)
     candidates = candidate_weight_grid(len(components.columns))
     rows = []
-    cached_weights = pd.Series([0.45, 0.35, 0.20], index=components.columns)
+    if len(component_cols) == 3:
+        cached_weights = np.array([0.45, 0.35, 0.20], dtype=float)
+    else:
+        cached_weights = np.full(len(component_cols), 1 / len(component_cols), dtype=float)
     cached_buy, cached_sell = 65, 35
     last_optimized_i = None
     previous_position = 0
@@ -534,26 +669,24 @@ def build_walk_forward_alpha_signal(components, target, cost_rate):
     for i in range(ALPHA_MIN_TRAIN, len(frame)):
         if last_optimized_i is None or i - last_optimized_i >= REOPTIMIZE_EVERY_DAYS:
             start = max(0, i - WALK_FORWARD_WINDOW)
-            train = frame.iloc[start:i]
-            cached_weights, _ = optimize_weights_for_sharpe(
-                train[components.columns],
-                train["target"],
+            train_matrix = component_matrix[start:i]
+            train_target = target_values[start:i]
+            cached_weights, _ = optimize_weights_for_sharpe_array(
+                train_matrix,
+                train_target,
                 candidates,
                 cost_rate,
             )
-            train_score = pd.Series(
-                (50 + 12.5 * (train[components.columns].to_numpy(dtype=float) @ cached_weights.to_numpy())).clip(0, 100),
-                index=train.index,
-            )
-            cached_buy, cached_sell, _ = optimize_thresholds_for_sharpe(
+            train_score = np.clip(50 + 12.5 * (train_matrix @ cached_weights), 0, 100)
+            cached_buy, cached_sell, _ = optimize_thresholds_for_sharpe_array(
                 train_score,
-                train["target"],
+                train_target,
                 cost_rate,
             )
             last_optimized_i = i
 
         idx = frame.index[i]
-        raw_score = float(frame.loc[idx, components.columns].to_numpy(dtype=float) @ cached_weights.to_numpy())
+        raw_score = float(component_matrix[i] @ cached_weights)
         alpha_score = float(np.clip(50 + 12.5 * raw_score, 0, 100))
         if alpha_score >= cached_buy:
             position = 1
@@ -563,7 +696,7 @@ def build_walk_forward_alpha_signal(components, target, cost_rate):
             position = 0
 
         turnover = abs(position - previous_position)
-        strategy_return = position * frame.loc[idx, "target"] - turnover * cost_rate
+        strategy_return = position * target_values[i] - turnover * cost_rate
         row = {
             "Alpha Score": round(alpha_score, 0),
             "Trading Signal": {1: "BUY", -1: "SELL", 0: "NEUTRAL"}[position],
@@ -571,9 +704,9 @@ def build_walk_forward_alpha_signal(components, target, cost_rate):
             "Buy Threshold": cached_buy,
             "Sell Threshold": cached_sell,
             "Strategy Return": strategy_return,
-            "Buy & Hold Return": frame.loc[idx, "target"],
+            "Buy & Hold Return": target_values[i],
         }
-        for col, weight in cached_weights.items():
+        for col, weight in zip(component_cols, cached_weights):
             row[f"Alpha Weight: {col}"] = weight
         rows.append((idx, row))
         previous_position = position
@@ -602,140 +735,185 @@ def predictive_tests(features, target):
 # ─────────────────────────────────────────────
 # FEATURE ENGINEERING
 # ─────────────────────────────────────────────
-returns = pd.DataFrame(index=data.index)
-returns["BTC_ret"]        = data["BTC"].pct_change()
-returns["NASDAQ_ret"]     = data["NASDAQ"].pct_change()
-returns["DXY_ret"]        = data["DXY"].pct_change()
-returns["GOLD_ret"]       = data["GOLD"].pct_change()
-returns["OIL_ret"]        = data["OIL"].pct_change()
-returns["REAL_YIELD_chg"] = data["REAL_YIELD"].diff()
-returns["NASDAQ_lag1"]    = returns["NASDAQ_ret"].shift(1)
-returns["DXY_lag1"]       = returns["DXY_ret"].shift(1)
-returns["REAL_YIELD_lag1"]= returns["REAL_YIELD_chg"].shift(1)
-returns = returns.dropna()
+@st.cache_data(show_spinner="Building model signals...")
+def build_analysis(data, transaction_cost_bps, collect_timings=False):
+    timings = {} if collect_timings else None
 
-if len(returns) < 20:
-    st.error("Insufficient data after cleaning.")
-    st.stop()
-    raise SystemExit
+    with timed("feature_engineering", timings):
+        returns = pd.DataFrame(index=data.index)
+        returns["BTC_ret"] = data["BTC"].pct_change()
+        returns["NASDAQ_ret"] = data["NASDAQ"].pct_change()
+        returns["DXY_ret"] = data["DXY"].pct_change()
+        returns["GOLD_ret"] = data["GOLD"].pct_change()
+        returns["OIL_ret"] = data["OIL"].pct_change()
+        returns["REAL_YIELD_chg"] = data["REAL_YIELD"].diff()
+        returns["NASDAQ_lag1"] = returns["NASDAQ_ret"].shift(1)
+        returns["DXY_lag1"] = returns["DXY_ret"].shift(1)
+        returns["REAL_YIELD_lag1"] = returns["REAL_YIELD_chg"].shift(1)
+        returns = returns.dropna()
 
-# ─────────────────────────────────────────────
-# MODEL
-# ─────────────────────────────────────────────
-features = ["NASDAQ_ret","DXY_ret","GOLD_ret","OIL_ret",
-            "REAL_YIELD_chg","NASDAQ_lag1","DXY_lag1","REAL_YIELD_lag1"]
-X = returns[features]
-y = returns["BTC_ret"]
+        if len(returns) < 20:
+            raise ValueError("Insufficient data after cleaning.")
 
-linreg    = LinearRegression().fit(X, y)
-coeffs    = pd.Series(linreg.coef_, index=features)
-model_pred_series = pd.Series(linreg.predict(X), index=X.index, name="Model Predicted BTC Return")
-rf        = RandomForestRegressor(n_estimators=100, random_state=42).fit(X, y)
-importance= pd.Series(rf.feature_importances_, index=features)
+        features = [
+            "NASDAQ_ret",
+            "DXY_ret",
+            "GOLD_ret",
+            "OIL_ret",
+            "REAL_YIELD_chg",
+            "NASDAQ_lag1",
+            "DXY_lag1",
+            "REAL_YIELD_lag1",
+        ]
+        X = returns[features]
+        y = returns["BTC_ret"]
 
-# ─────────────────────────────────────────────
-# ATTRIBUTION
-# ─────────────────────────────────────────────
-latest  = X.iloc[-1]
-contrib = coeffs * latest
-pred    = contrib.sum()
-actual  = y.iloc[-1]
+    with timed("same_day_models", timings):
+        linreg = LinearRegression().fit(X, y)
+        coeffs = pd.Series(linreg.coef_, index=features)
+        rf = RandomForestRegressor(n_estimators=100, random_state=42, n_jobs=-1).fit(X, y)
+        importance = pd.Series(rf.feature_importances_, index=features)
 
-drivers = []
-for f, v in contrib.sort_values(ascending=False).items():
-    if abs(v) > 0.001:
-        drivers.append(f"{f} {'up' if v > 0 else 'down'}")
-    if len(drivers) >= 3:
-        break
-narrative = "BTC move driven by: " + (", ".join(drivers) if drivers else "no dominant factor")
+    latest = X.iloc[-1]
+    contrib = coeffs * latest
+    pred = contrib.sum()
+    actual = y.iloc[-1]
 
-# REGIME, ALPHA SIGNAL, AND BACKTEST
-target_next = returns["BTC_ret"].shift(-1).rename("Next Day BTC Return")
-next_day_frame = returns[features].join(target_next).dropna()
-X_next = next_day_frame[features]
-y_next = next_day_frame["Next Day BTC Return"]
-cost_rate = transaction_cost_bps / 10000
+    drivers = []
+    for f, v in contrib.sort_values(ascending=False).items():
+        if abs(v) > 0.001:
+            drivers.append(f"{f} {'up' if v > 0 else 'down'}")
+        if len(drivers) >= 3:
+            break
+    narrative = "BTC move driven by: " + (", ".join(drivers) if drivers else "no dominant factor")
 
-wf_model_pred, wf_model_coefs = walk_forward_linear_model(
-    X_next,
-    y_next,
-    min_train=WALK_FORWARD_MIN_TRAIN,
-    train_window=WALK_FORWARD_WINDOW,
-)
+    target_next = returns["BTC_ret"].shift(-1).rename("Next Day BTC Return")
+    next_day_frame = returns[features].join(target_next).dropna()
+    X_next = next_day_frame[features]
+    y_next = next_day_frame["Next Day BTC Return"]
+    cost_rate = transaction_cost_bps / 10000
 
-regime_features = pd.DataFrame(index=X_next.index)
-regime_features["NASDAQ_z"] = safe_rolling_z(returns["NASDAQ_ret"]).reindex(X_next.index)
-regime_features["DXY_z"] = safe_rolling_z(returns["DXY_ret"]).reindex(X_next.index)
-regime_features["REAL_YIELD_z"] = safe_rolling_z(returns["REAL_YIELD_chg"]).reindex(X_next.index)
-regime_features["GOLD_z"] = safe_rolling_z(returns["GOLD_ret"]).reindex(X_next.index)
+    with timed("walk_forward_model", timings):
+        wf_model_pred, wf_model_coefs = walk_forward_linear_model(
+            X_next,
+            y_next,
+            min_train=WALK_FORWARD_MIN_TRAIN,
+            train_window=WALK_FORWARD_WINDOW,
+        )
 
-wf_regime_pred, wf_regime_coefs = walk_forward_linear_model(
-    regime_features,
-    y_next,
-    min_train=WALK_FORWARD_MIN_TRAIN,
-    train_window=WALK_FORWARD_WINDOW,
-)
-regime_weights = wf_regime_coefs.apply(normalize_abs_weights, axis=1)
-regime_raw = (regime_features * regime_weights).sum(axis=1, min_count=1)
+    regime_features = pd.DataFrame(index=X_next.index)
+    regime_features["NASDAQ_z"] = safe_rolling_z(returns["NASDAQ_ret"]).reindex(X_next.index)
+    regime_features["DXY_z"] = safe_rolling_z(returns["DXY_ret"]).reindex(X_next.index)
+    regime_features["REAL_YIELD_z"] = safe_rolling_z(returns["REAL_YIELD_chg"]).reindex(X_next.index)
+    regime_features["GOLD_z"] = safe_rolling_z(returns["GOLD_ret"]).reindex(X_next.index)
 
-regime = pd.DataFrame(index=X_next.index)
-regime["Regime Score"] = (50 + 15 * regime_raw).clip(0, 100)
-regime["Regime"] = regime["Regime Score"].apply(classify_regime)
+    with timed("walk_forward_regime", timings):
+        wf_regime_pred, wf_regime_coefs = walk_forward_linear_model(
+            regime_features,
+            y_next,
+            min_train=WALK_FORWARD_MIN_TRAIN,
+            train_window=WALK_FORWARD_WINDOW,
+        )
+    regime_weights = wf_regime_coefs.apply(normalize_abs_weights, axis=1)
+    regime_raw = (regime_features * regime_weights).sum(axis=1, min_count=1)
 
-btc_momentum_7d = data["BTC"].pct_change(7).reindex(X_next.index).ffill()
-model_prediction_z = safe_rolling_z(wf_model_pred).reindex(X_next.index)
-model_prediction_z[wf_model_pred.reindex(X_next.index).isna()] = np.nan
-regime_prediction_z = safe_rolling_z(wf_regime_pred).reindex(X_next.index)
-regime_prediction_z[wf_regime_pred.reindex(X_next.index).isna()] = np.nan
+    regime = pd.DataFrame(index=X_next.index)
+    regime["Regime Score"] = (50 + 15 * regime_raw).clip(0, 100)
+    regime["Regime"] = regime["Regime Score"].apply(classify_regime)
 
-alpha_components = pd.DataFrame(index=X_next.index)
-alpha_components["Model Prediction z"] = model_prediction_z
-alpha_components["Regime Prediction z"] = regime_prediction_z
-alpha_components["BTC 7D Momentum z"] = safe_rolling_z(btc_momentum_7d)
+    btc_momentum_7d = data["BTC"].pct_change(7).reindex(X_next.index).ffill()
+    model_prediction_z = safe_rolling_z(wf_model_pred).reindex(X_next.index)
+    model_prediction_z[wf_model_pred.reindex(X_next.index).isna()] = np.nan
+    regime_prediction_z = safe_rolling_z(wf_regime_pred).reindex(X_next.index)
+    regime_prediction_z[wf_regime_pred.reindex(X_next.index).isna()] = np.nan
 
-signals = build_walk_forward_alpha_signal(alpha_components, y_next, cost_rate)
+    alpha_components = pd.DataFrame(index=X_next.index)
+    alpha_components["Model Prediction z"] = model_prediction_z
+    alpha_components["Regime Prediction z"] = regime_prediction_z
+    alpha_components["BTC 7D Momentum z"] = safe_rolling_z(btc_momentum_7d)
 
-if len(signals) < 20:
-    st.error("Insufficient walk-forward data after calibration.")
-    st.stop()
-    raise SystemExit
+    with timed("alpha_signal", timings):
+        signals = build_walk_forward_alpha_signal(alpha_components, y_next, cost_rate)
 
-signals["Regime"] = regime["Regime"].reindex(signals.index)
-signals["Regime Score"] = regime["Regime Score"].reindex(signals.index)
-signals["Model Predicted Return"] = wf_model_pred.reindex(signals.index)
-signals["BTC 7D Momentum"] = btc_momentum_7d.reindex(signals.index)
-signals["Strategy Equity"] = (1 + signals["Strategy Return"]).cumprod()
-signals["Buy & Hold Equity"] = (1 + signals["Buy & Hold Return"]).cumprod()
-active_strategy_returns = signals.loc[signals["Position"] != 0, "Strategy Return"]
+    if len(signals) < 20:
+        raise ValueError("Insufficient walk-forward data after calibration.")
 
-backtest_stats = pd.Series(
-    {
-        "Strategy Sharpe": annualized_sharpe(signals["Strategy Return"]),
-        "Buy & Hold Sharpe": annualized_sharpe(signals["Buy & Hold Return"]),
-        "Strategy Total Return": signals["Strategy Equity"].iloc[-1] - 1,
-        "Buy & Hold Total Return": signals["Buy & Hold Equity"].iloc[-1] - 1,
-        "Strategy Max Drawdown": max_drawdown(signals["Strategy Equity"]),
-        "Buy & Hold Max Drawdown": max_drawdown(signals["Buy & Hold Equity"]),
-        "Signal Win Rate": (active_strategy_returns > 0).mean() if not active_strategy_returns.empty else np.nan,
-        "Trading Cost bps": transaction_cost_bps,
-        "Latest Buy Threshold": signals["Buy Threshold"].iloc[-1],
-        "Latest Sell Threshold": signals["Sell Threshold"].iloc[-1],
+    signals["Regime"] = regime["Regime"].reindex(signals.index)
+    signals["Regime Score"] = regime["Regime Score"].reindex(signals.index)
+    signals["Model Predicted Return"] = wf_model_pred.reindex(signals.index)
+    signals["BTC 7D Momentum"] = btc_momentum_7d.reindex(signals.index)
+    signals["Strategy Equity"] = (1 + signals["Strategy Return"]).cumprod()
+    signals["Buy & Hold Equity"] = (1 + signals["Buy & Hold Return"]).cumprod()
+    active_strategy_returns = signals.loc[signals["Position"] != 0, "Strategy Return"]
+
+    backtest_stats = pd.Series(
+        {
+            "Strategy Sharpe": annualized_sharpe(signals["Strategy Return"]),
+            "Buy & Hold Sharpe": annualized_sharpe(signals["Buy & Hold Return"]),
+            "Strategy Total Return": signals["Strategy Equity"].iloc[-1] - 1,
+            "Buy & Hold Total Return": signals["Buy & Hold Equity"].iloc[-1] - 1,
+            "Strategy Max Drawdown": max_drawdown(signals["Strategy Equity"]),
+            "Buy & Hold Max Drawdown": max_drawdown(signals["Buy & Hold Equity"]),
+            "Signal Win Rate": (active_strategy_returns > 0).mean() if not active_strategy_returns.empty else np.nan,
+            "Trading Cost bps": transaction_cost_bps,
+            "Latest Buy Threshold": signals["Buy Threshold"].iloc[-1],
+            "Latest Sell Threshold": signals["Sell Threshold"].iloc[-1],
+        }
+    )
+
+    feature_test_frame = pd.concat([regime_features, alpha_components], axis=1)
+    predictive_test_results = predictive_tests(feature_test_frame, y_next)
+    latest_signal = signals.iloc[-1]
+    latest_regime_weights = regime_weights.dropna(how="all").iloc[-1]
+    latest_alpha_weights = latest_signal.filter(like="Alpha Weight: ").rename(
+        lambda x: x.replace("Alpha Weight: ", "")
+    )
+
+    return {
+        "returns": returns,
+        "coeffs": coeffs,
+        "importance": importance,
+        "contrib": contrib,
+        "pred": pred,
+        "actual": actual,
+        "narrative": narrative,
+        "signals": signals,
+        "regime_weights": regime_weights,
+        "backtest_stats": backtest_stats,
+        "predictive_test_results": predictive_test_results,
+        "latest_signal": latest_signal,
+        "latest_regime_weights": latest_regime_weights,
+        "latest_alpha_weights": latest_alpha_weights,
+        "timings": timings or {},
     }
-)
 
-feature_test_frame = pd.concat(
-    [
-        regime_features,
-        alpha_components,
-    ],
-    axis=1,
-)
-predictive_test_results = predictive_tests(feature_test_frame, y_next)
-latest_signal = signals.iloc[-1]
-latest_regime_weights = regime_weights.dropna(how="all").iloc[-1]
-latest_alpha_weights = latest_signal.filter(like="Alpha Weight: ").rename(
-    lambda x: x.replace("Alpha Weight: ", "")
-)
+
+try:
+    with timed("build_analysis"):
+        analysis = build_analysis(data, float(transaction_cost_bps), bool(show_timing))
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
+    raise SystemExit
+
+returns = analysis["returns"]
+coeffs = analysis["coeffs"]
+importance = analysis["importance"]
+contrib = analysis["contrib"]
+pred = analysis["pred"]
+actual = analysis["actual"]
+narrative = analysis["narrative"]
+signals = analysis["signals"]
+regime_weights = analysis["regime_weights"]
+backtest_stats = analysis["backtest_stats"]
+predictive_test_results = analysis["predictive_test_results"]
+latest_signal = analysis["latest_signal"]
+latest_regime_weights = analysis["latest_regime_weights"]
+latest_alpha_weights = analysis["latest_alpha_weights"]
+
+if show_timing:
+    for label, elapsed in analysis.get("timings", {}).items():
+        st.sidebar.write(f"{label}: {elapsed:.2f}s")
 
 # ─────────────────────────────────────────────
 # LAYOUT

@@ -6,16 +6,22 @@ from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestRegressor
 from contextlib import contextmanager
 from datetime import datetime
+from io import StringIO
 from itertools import product
+import json
 import requests
 import os
+import socket
 import sys
 import time
 from pathlib import Path
 
 BASE_DIR      = Path(__file__).resolve().parent
 CACHE_FILE    = BASE_DIR / "backup_data.csv"
+CACHE_METADATA_FILE = BASE_DIR / "backup_data.meta.json"
+REAL_YIELD_CACHE_FILE = BASE_DIR / "real_yield_cache.csv"
 CACHE_MAX_AGE = 23   # hours
+REAL_YIELD_WARNING_AGE_DAYS = 4
 TRADING_DAYS_PER_YEAR = 365
 WALK_FORWARD_MIN_TRAIN = 365
 WALK_FORWARD_WINDOW = 730
@@ -23,33 +29,78 @@ ALPHA_MIN_TRAIN = 180
 REOPTIMIZE_EVERY_DAYS = 7
 REQUIRED_COLS = ["BTC", "NASDAQ", "DXY", "GOLD", "OIL", "REAL_YIELD"]
 YFINANCE_TICKERS = [("QQQ", "NASDAQ"), ("DX-Y.NYB", "DXY"), ("GC=F", "GOLD"), ("CL=F", "OIL")]
+NASDAQ_FALLBACK_TICKERS = [
+    ("QQQ", "NASDAQ"),
+    ("UUP", "DXY"),
+    ("GLD", "GOLD"),
+    ("USO", "OIL"),
+]
+COMMON_LOCAL_PROXY_PORTS = (7890, 7897, 10809, 1080)
 
 # ── PROXY CONFIG (required for mainland China) ───────────────────────────────
-# Proxy is optional. Streamlit Cloud cannot reach your local 127.0.0.1 proxy,
-# so keep it off by default and enable it only in local environments that need it.
-def get_proxy_port():
-    raw = os.environ.get("BTC_PROXY_PORT") or os.environ.get("PROXY_PORT")
-    if raw is None:
-        try:
-            raw = st.secrets.get("BTC_PROXY_PORT")
-        except Exception:
-            raw = None
-    if raw in (None, "", "0", "none", "None", "false", "False"):
-        return None
+# Proxy is optional. Explicit app settings take priority, followed by standard
+# proxy environment variables and a quick local-port check for desktop use.
+def get_setting(name):
+    value = os.environ.get(name)
+    if value not in (None, ""):
+        return value
     try:
-        return int(raw)
-    except ValueError:
+        value = st.secrets.get(name)
+    except Exception:
+        value = None
+    return value
+
+
+def normalize_proxy_url(value):
+    if value in (None, "", "0", "none", "None", "false", "False"):
         return None
+    value = str(value).strip()
+    if "://" not in value:
+        value = f"http://{value}"
+    return value
 
 
-PROXY_PORT = get_proxy_port()
+def local_port_is_open(port, timeout=0.08):
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def get_proxy_config():
+    explicit_url = normalize_proxy_url(get_setting("BTC_PROXY_URL"))
+    if explicit_url:
+        return explicit_url, "BTC_PROXY_URL"
+
+    explicit_port = get_setting("BTC_PROXY_PORT") or get_setting("PROXY_PORT")
+    if explicit_port not in (None, ""):
+        try:
+            port = int(explicit_port)
+            return f"http://127.0.0.1:{port}", "BTC_PROXY_PORT"
+        except (TypeError, ValueError):
+            pass
+
+    for env_name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy"):
+        env_proxy = normalize_proxy_url(os.environ.get(env_name))
+        if env_proxy:
+            return env_proxy, env_name
+
+    auto_detect = get_setting("BTC_PROXY_AUTO_DETECT")
+    if auto_detect not in ("0", "false", "False", "no", "No"):
+        for port in COMMON_LOCAL_PROXY_PORTS:
+            if local_port_is_open(port):
+                return f"http://127.0.0.1:{port}", f"auto-detected local port {port}"
+
+    return None, "direct connection"
+
+
+PROXY_URL, PROXY_SOURCE = get_proxy_config()
 
 SESSION = requests.Session()
-SESSION.trust_env = False   # ignore broken system proxy env vars
-
-if PROXY_PORT:
-    proxy_url = f"http://127.0.0.1:{PROXY_PORT}"
-    SESSION.proxies.update({"http": proxy_url, "https": proxy_url})
+SESSION.trust_env = False
+if PROXY_URL:
+    SESSION.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -94,8 +145,12 @@ def cache_is_fresh():
     if age_hours >= CACHE_MAX_AGE:
         return False
     try:
-        cached = pd.read_csv(CACHE_FILE, nrows=5)
-        return not cached.empty and all(c in cached.columns for c in REQUIRED_COLS)
+        cached = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
+        if cached.empty or any(c not in cached.columns for c in REQUIRED_COLS):
+            return False
+        latest_observation = pd.Timestamp(cached.index[-1]).normalize()
+        observation_age_days = (pd.Timestamp.now().normalize() - latest_observation).days
+        return observation_age_days <= 2
     except Exception:
         return False
 
@@ -103,7 +158,51 @@ def load_cache():
     df = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
     status = {col: "cache" for col in df.columns}
     timestamps = {col: df.index[-1] for col in df.columns}
+    if CACHE_METADATA_FILE.exists():
+        try:
+            metadata = json.loads(CACHE_METADATA_FILE.read_text(encoding="utf-8"))
+            source_status = metadata.get("status", {})
+            for col in df.columns:
+                if col in source_status:
+                    status[col] = f"cache; last source: {source_status[col]}"
+            if "_macro_info" in source_status:
+                status["_macro_info"] = source_status["_macro_info"]
+            for col, value in metadata.get("timestamps", {}).items():
+                timestamps[col] = pd.Timestamp(value)
+        except Exception:
+            pass
+    if REAL_YIELD_CACHE_FILE.exists():
+        try:
+            real_yield_cache = pd.read_csv(
+                REAL_YIELD_CACHE_FILE,
+                index_col=0,
+                parse_dates=True,
+            ).dropna()
+            if not real_yield_cache.empty:
+                timestamps["REAL_YIELD"] = real_yield_cache.index[-1]
+        except Exception:
+            pass
     return df, status, timestamps
+
+
+def save_cache(data, status, timestamps):
+    data.to_csv(CACHE_FILE)
+    metadata = {
+        "status": {
+            key: value
+            for key, value in status.items()
+            if key in REQUIRED_COLS or key == "_macro_info"
+        },
+        "timestamps": {
+            key: str(pd.Timestamp(value))
+            for key, value in timestamps.items()
+            if value is not None
+        },
+    }
+    CACHE_METADATA_FILE.write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8",
+    )
 
 
 def load_cache_if_complete():
@@ -290,14 +389,19 @@ def load_macro_yfinance_batch(start_date):
         return series_by_name, {name: msg for _, name in YFINANCE_TICKERS}, timestamps
 
     try:
-        proxy_url = f"http://127.0.0.1:{PROXY_PORT}" if PROXY_PORT else ""
         old_http = os.environ.get("HTTP_PROXY")
         old_https = os.environ.get("HTTPS_PROXY")
-        if proxy_url:
-            os.environ["HTTP_PROXY"] = proxy_url
-            os.environ["HTTPS_PROXY"] = proxy_url
+        if PROXY_URL:
+            os.environ["HTTP_PROXY"] = PROXY_URL
+            os.environ["HTTPS_PROXY"] = PROXY_URL
 
         try:
+            try:
+                yf.config.network.proxy = PROXY_URL
+                yf.config.network.retries = 2
+            except (AttributeError, TypeError):
+                pass
+
             raw = yf.download(
                 [ticker for ticker, _ in YFINANCE_TICKERS],
                 start=pd.Timestamp(start_date).strftime("%Y-%m-%d"),
@@ -333,8 +437,214 @@ def load_macro_yfinance_batch(start_date):
 # MAIN DATA LOADER
 # ─────────────────────────────────────────────
 
-@st.cache_data
-def load_data(force_refresh=False):
+def load_macro_nasdaq_etfs(start_date):
+    """
+    Load a consistent ETF proxy set from Nasdaq when Yahoo is unavailable.
+
+    UUP, GLD and USO are not identical to DXY, gold futures and WTI futures.
+    The fallback replaces the full feature history rather than splicing proxy
+    returns onto the original instruments.
+    """
+    series_by_name = {}
+    statuses = {}
+    timestamps = {}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/plain, */*",
+        "Origin": "https://www.nasdaq.com",
+        "Referer": "https://www.nasdaq.com/market-activity/",
+    }
+    start_text = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+    end_text = pd.Timestamp.now().strftime("%Y-%m-%d")
+
+    for ticker, name in NASDAQ_FALLBACK_TICKERS:
+        try:
+            response = SESSION.get(
+                f"https://api.nasdaq.com/api/quote/{ticker}/historical",
+                params={
+                    "assetclass": "etf",
+                    "fromdate": start_text,
+                    "todate": end_text,
+                    "limit": "5000",
+                },
+                headers=headers,
+                timeout=25,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            rows = (
+                payload.get("data", {})
+                .get("tradesTable", {})
+                .get("rows", [])
+            )
+            if not rows:
+                raise ValueError("Nasdaq returned no historical rows")
+
+            frame = pd.DataFrame(rows)
+            dates = pd.to_datetime(frame["date"], errors="coerce")
+            closes = pd.to_numeric(
+                frame["close"].astype(str).str.replace(r"[$,]", "", regex=True),
+                errors="coerce",
+            )
+            series = pd.Series(closes.to_numpy(), index=dates, name=name).dropna()
+            series.index = normalize_daily_index(series.index)
+            series = series[~series.index.duplicated(keep="last")].sort_index()
+            if series.empty:
+                raise ValueError("Nasdaq close history was not numeric")
+
+            series_by_name[name] = series
+            proxy_label = ticker if ticker == "QQQ" else f"{ticker} proxy"
+            statuses[name] = f"live (Nasdaq {proxy_label})"
+            timestamps[name] = series.index[-1]
+        except Exception as exc:
+            statuses[name] = f"failed Nasdaq {ticker} ({type(exc).__name__}: {exc})"
+
+    return series_by_name, statuses, timestamps
+
+
+def clean_real_yield(raw):
+    """Normalize FRED/cache data into a dated REAL_YIELD series."""
+    if raw is None or raw.empty:
+        return None
+
+    frame = raw.copy()
+    if "REAL_YIELD" in frame.columns:
+        value_col = "REAL_YIELD"
+    elif "DFII10" in frame.columns:
+        value_col = "DFII10"
+    elif len(frame.columns) == 1:
+        value_col = frame.columns[0]
+    else:
+        return None
+
+    series = pd.to_numeric(frame[value_col], errors="coerce").dropna()
+    if series.empty:
+        return None
+
+    series.index = normalize_daily_index(series.index)
+    series = series[~series.index.duplicated(keep="last")].sort_index()
+    return series.astype(float).rename("REAL_YIELD")
+
+
+def read_real_yield_fallback():
+    """Use an exact last-known FRED observation; never estimate the yield."""
+    candidates = [
+        (REAL_YIELD_CACHE_FILE, "real-yield cache"),
+        (CACHE_FILE, "complete-data cache"),
+    ]
+    errors = []
+
+    for path, label in candidates:
+        if not path.exists():
+            continue
+        try:
+            cached = pd.read_csv(path, index_col=0, parse_dates=True)
+            series = clean_real_yield(cached)
+            if series is not None:
+                if path == CACHE_FILE:
+                    series = series[series.index.dayofweek < 5]
+                return series, label, errors
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}: {exc}")
+
+    return None, None, errors
+
+
+def load_treasury_real_yield(start_year):
+    """Load the official U.S. Treasury 10-year par real yield by calendar year."""
+    pieces = []
+    current_year = pd.Timestamp.now().year
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    url = (
+        "https://home.treasury.gov/resource-center/data-chart-center/"
+        "interest-rates/TextView"
+    )
+
+    for year in range(max(2003, int(start_year)), current_year + 1):
+        response = SESSION.get(
+            url,
+            params={
+                "type": "daily_treasury_real_yield_curve",
+                "field_tdr_date_value": str(year),
+            },
+            headers=headers,
+            timeout=40,
+        )
+        response.raise_for_status()
+        tables = pd.read_html(StringIO(response.text), match="10 YR")
+        if not tables:
+            continue
+        frame = tables[0]
+        if "Date" not in frame.columns or "10 YR" not in frame.columns:
+            continue
+        dates = pd.to_datetime(frame["Date"], errors="coerce")
+        values = pd.to_numeric(frame["10 YR"], errors="coerce")
+        piece = pd.Series(values.to_numpy(), index=dates, name="REAL_YIELD").dropna()
+        if not piece.empty:
+            pieces.append(piece)
+
+    if not pieces:
+        return None
+
+    series = pd.concat(pieces).sort_index()
+    series.index = normalize_daily_index(series.index)
+    return series[~series.index.duplicated(keep="last")].astype(float)
+
+
+def load_real_yield():
+    """
+    Load the daily FRED DFII10 series through the proxy-aware session.
+
+    FRED publishes on business days. Weekend scoring therefore uses the exact
+    last published observation, while its source date remains visible.
+    """
+    errors = []
+    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10"
+
+    try:
+        response = SESSION.get(url, timeout=(5, 12))
+        response.raise_for_status()
+        raw = pd.read_csv(StringIO(response.text), index_col=0, parse_dates=True)
+        series = clean_real_yield(raw)
+        if series is None:
+            raise ValueError("FRED returned no numeric DFII10 observations")
+        series.to_frame().to_csv(REAL_YIELD_CACHE_FILE)
+        return series, "live", series.index[-1], errors
+    except Exception as exc:
+        errors.append(f"FRED: {type(exc).__name__}: {exc}")
+
+    fallback, label, fallback_errors = read_real_yield_fallback()
+    errors.extend(fallback_errors)
+
+    try:
+        if fallback is None or fallback.empty:
+            treasury_start_year = 2020
+        else:
+            treasury_start_year = fallback.index[-1].year
+        treasury = load_treasury_real_yield(treasury_start_year)
+        if treasury is not None:
+            if fallback is not None:
+                treasury = pd.concat([fallback, treasury]).sort_index()
+                treasury = treasury[~treasury.index.duplicated(keep="last")]
+            treasury.to_frame().to_csv(REAL_YIELD_CACHE_FILE)
+            return (
+                treasury,
+                "live (U.S. Treasury fallback)",
+                treasury.index[-1],
+                errors,
+            )
+    except Exception as exc:
+        errors.append(f"U.S. Treasury: {type(exc).__name__}: {exc}")
+
+    if fallback is not None:
+        return fallback, f"stale {label}", fallback.index[-1], errors
+
+    return None, "failed", None, errors
+
+
+@st.cache_data(ttl=900)
+def load_data(force_refresh=False, network_route=None):
+    del network_route
 
     # Use cache if fresh — avoids hitting APIs on every reload
     if not force_refresh and cache_is_fresh():
@@ -353,7 +663,8 @@ def load_data(force_refresh=False):
         # Show exactly why every source failed
         error_lines = "\n".join([f"  • {src}: {msg}" for src, msg in btc_errors.items()])
         if os.path.exists(CACHE_FILE):
-            data = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
+            data, _, cached_timestamps = load_cache()
+            timestamps.update(cached_timestamps)
             status["BTC"] = "stale cache (all live sources failed)"
             status["_btc_errors"] = error_lines
         else:
@@ -372,34 +683,47 @@ def load_data(force_refresh=False):
     # ── MACRO (batched yfinance via proxy) ───
     macro_start = data["BTC"].index.min()
     macro_series, macro_status, macro_timestamps = load_macro_yfinance_batch(macro_start)
+    expected_macro_names = {name for _, name in YFINANCE_TICKERS}
+    if set(macro_series) != expected_macro_names:
+        yahoo_diagnostics = "\n".join(
+            f"{name}: {message}" for name, message in macro_status.items()
+        )
+        nasdaq_series, nasdaq_status, nasdaq_timestamps = load_macro_nasdaq_etfs(macro_start)
+        if set(nasdaq_series) == expected_macro_names:
+            macro_series = nasdaq_series
+            macro_status = nasdaq_status
+            macro_timestamps = nasdaq_timestamps
+            status["_macro_info"] = (
+                "Yahoo was unavailable; using a consistent Nasdaq ETF proxy set "
+                "(QQQ, UUP, GLD, USO) for the full model history."
+            )
+            status["_macro_errors"] = yahoo_diagnostics
+
     status.update(macro_status)
     timestamps.update(macro_timestamps)
     for name, series in macro_series.items():
         data[name] = series
 
     # ── FRED REAL YIELD ──────────────────────
-    try:
-        ry = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10", index_col=0, parse_dates=True)
-        ry.index = pd.to_datetime(ry.index).tz_localize(None).normalize()
-
-        ry.columns = ["REAL_YIELD"]
-        ry.index = pd.to_datetime(ry.index).normalize()
-        ry = ry[ry["REAL_YIELD"] != "."]
-        ry["REAL_YIELD"] = ry["REAL_YIELD"].astype(float)
+    real_yield, real_yield_status, real_yield_timestamp, real_yield_errors = load_real_yield()
+    status["REAL_YIELD"] = real_yield_status
+    if real_yield_errors:
+        status["_real_yield_errors"] = "\n".join(real_yield_errors)
+    if real_yield_timestamp is not None:
+        timestamps["REAL_YIELD"] = real_yield_timestamp
+    if real_yield is not None:
         if "REAL_YIELD" in data.columns:
             data = data.drop(columns=["REAL_YIELD"])
-        data = data.join(ry, how="left")
-        status["REAL_YIELD"] = "live"
-        timestamps["REAL_YIELD"] = ry.index[-1]
-    except Exception as e:
-        status["REAL_YIELD"] = f"failed ({type(e).__name__}: {e})"
+        data = data.join(real_yield, how="left")
 
     missing_live = [c for c in REQUIRED_COLS if c not in data.columns]
     if missing_live:
         cached_data, _, cached_timestamps = load_cache_if_complete()
         if cached_data is not None:
             status["_info"] = f"live refresh incomplete ({missing_live}); showing last complete cache."
-            return cached_data, status, {**cached_timestamps, **timestamps}
+            for column in REQUIRED_COLS:
+                status[column] = "stale complete-data cache"
+            return cached_data, status, cached_timestamps
 
     # ── CLEAN + SAVE ─────────────────────────
     data = data.sort_index()
@@ -425,7 +749,9 @@ def load_data(force_refresh=False):
         cached_data, _, cached_timestamps = load_cache_if_complete()
         if cached_data is not None:
             status["_info"] = "live refresh returned no overlapping rows; showing last complete cache."
-            return cached_data, status, {**cached_timestamps, **timestamps}
+            for column in REQUIRED_COLS:
+                status[column] = "stale complete-data cache"
+            return cached_data, status, cached_timestamps
 
     # Optional: show coverage so you can see which series is too sparse
     st.sidebar.write("### 📊 Coverage")
@@ -434,7 +760,7 @@ def load_data(force_refresh=False):
             st.sidebar.write(f"{c}: {data[c].notna().sum()} rows")
 
     if not data.empty:
-        data.to_csv(CACHE_FILE)
+        save_cache(data, status, timestamps)
 
     return data, status, timestamps
 
@@ -442,7 +768,10 @@ if show_timing:
     st.sidebar.write("### Timing")
 
 with timed("load_data"):
-    data, status, timestamps = load_data(force_refresh=manual_refresh)
+    data, status, timestamps = load_data(
+        force_refresh=manual_refresh,
+        network_route=PROXY_URL or "direct",
+    )
 st.sidebar.write("### 🧪 Index Debug")
 
 for col in data.columns:
@@ -453,6 +782,13 @@ for col in data.columns:
 # ─────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────
+st.sidebar.write("### Network")
+if PROXY_URL:
+    st.sidebar.success(f"Proxy active: {PROXY_URL}")
+    st.sidebar.caption(PROXY_SOURCE)
+else:
+    st.sidebar.warning("Direct connection. Set BTC_PROXY_PORT if live sources time out.")
+
 st.sidebar.write("### 📡 Data Status")
 for k, v in status.items():
     if k == "_info":
@@ -460,13 +796,68 @@ for k, v in status.items():
     elif k == "_btc_errors":
         with st.sidebar.expander("🔍 BTC source errors"):
             st.text(v)
+    elif k == "_real_yield_errors":
+        with st.sidebar.expander("Real-yield source errors"):
+            st.text(v)
+    elif k == "_macro_info":
+        st.sidebar.info(v)
+    elif k == "_macro_errors":
+        with st.sidebar.expander("Yahoo source errors"):
+            st.text(v)
     else:
-        icon = "✅" if any(x in str(v) for x in ["live", "cache"]) else "❌"
+        status_text = str(v).lower()
+        if status_text.startswith("live"):
+            icon = "OK"
+        elif "stale" in status_text:
+            icon = "STALE"
+        elif "cache" in status_text:
+            icon = "CACHED"
+        else:
+            icon = "FAIL"
         st.sidebar.write(f"{icon} {k}: {v}")
 
 st.sidebar.write("### 🕒 Freshness")
 for k, t in timestamps.items():
     st.sidebar.write(f"{k}: {t}")
+
+real_yield_as_of = timestamps.get("REAL_YIELD")
+if real_yield_as_of is not None:
+    real_yield_age_days = max(
+        0,
+        (pd.Timestamp.now().normalize() - pd.Timestamp(real_yield_as_of).normalize()).days,
+    )
+    if real_yield_age_days > REAL_YIELD_WARNING_AGE_DAYS:
+        st.sidebar.warning(
+            f"Real yield is {real_yield_age_days} calendar days old. "
+            "Model inputs are stale; treat the signal as historical."
+        )
+
+btc_observations = data["BTC"].dropna() if "BTC" in data.columns else pd.Series(dtype=float)
+data_as_of = btc_observations.index[-1] if not btc_observations.empty else None
+data_age_days = None
+if data_as_of is not None:
+    data_age_days = max(
+        0,
+        (pd.Timestamp.now().normalize() - pd.Timestamp(data_as_of).normalize()).days,
+    )
+    st.sidebar.write(f"Displayed data as of: {pd.Timestamp(data_as_of):%Y-%m-%d}")
+
+fallback_mode = any(
+    "stale" in str(value).lower()
+    for key, value in status.items()
+    if not key.startswith("_")
+)
+if data_age_days is not None and data_age_days > 2:
+    st.error(
+        f"Historical fallback mode: displayed market data ends "
+        f"{pd.Timestamp(data_as_of):%Y-%m-%d} ({data_age_days} days old). "
+        "Charts and backtests remain available, but the signal is not current."
+    )
+elif fallback_mode:
+    st.warning(
+        "One or more live feeds are unavailable. Cached observations are being "
+        "used and are labeled with their source dates."
+    )
 st.sidebar.write(f"🕒 Run Time: {datetime.now().strftime('%H:%M:%S')}")
 st.sidebar.write(f"📊 Observations: {len(data)}")
 
@@ -776,7 +1167,7 @@ def build_analysis(data, transaction_cost_bps, collect_timings=False):
 
     latest = X.iloc[-1]
     contrib = coeffs * latest
-    pred = contrib.sum()
+    pred = float(linreg.predict(latest.to_frame().T)[0])
     actual = y.iloc[-1]
 
     drivers = []
@@ -918,7 +1309,7 @@ if show_timing:
 # ─────────────────────────────────────────────
 # LAYOUT
 # ─────────────────────────────────────────────
-sig1, sig2, sig3, sig4 = st.columns(4)
+sig1, sig2, sig3, sig4, sig5 = st.columns(5)
 with sig1:
     st.metric(
         "Regime",
@@ -928,7 +1319,8 @@ with sig1:
 with sig2:
     st.metric("BTC Alpha Score", f"{latest_signal['Alpha Score']:.0f}/100")
 with sig3:
-    st.metric("Trading Signal", latest_signal["Trading Signal"])
+    st.metric("Latest Evaluated Signal", latest_signal["Trading Signal"])
+    st.caption(f"Feature date {pd.Timestamp(latest_signal.name):%Y-%m-%d}")
 with sig4:
     sharpe_delta = backtest_stats["Strategy Sharpe"] - backtest_stats["Buy & Hold Sharpe"]
     st.metric(
@@ -936,6 +1328,10 @@ with sig4:
         format_metric(backtest_stats["Strategy Sharpe"]),
         delta=f"{sharpe_delta:+.2f} vs HODL" if not pd.isna(sharpe_delta) else None,
     )
+with sig5:
+    st.metric("10Y Real Yield", f"{data['REAL_YIELD'].iloc[-1]:.2f}%")
+    if real_yield_as_of is not None:
+        st.caption(f"As of {pd.Timestamp(real_yield_as_of):%Y-%m-%d}")
 
 st.subheader("Regime + BTC Alpha Signal")
 st.line_chart(signals[["Alpha Score", "Regime Score"]].tail(365))
@@ -1000,7 +1396,7 @@ st.dataframe(contrib.sort_values(ascending=False).rename("Contribution"))
 
 col3, col4 = st.columns(2)
 with col3:
-    st.metric("Predicted BTC Return", f"{pred:.2%}")
+    st.metric("Fitted Same-Day BTC Return", f"{pred:.2%}")
 with col4:
     st.metric("Actual BTC Return", f"{actual:.2%}", delta=f"{(actual - pred):.2%} residual")
 

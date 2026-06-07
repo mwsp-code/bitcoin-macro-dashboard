@@ -1,7 +1,16 @@
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
 .idea/
+.vscode/
+.pytest_cache/
+.coverage
+htmlcov/
+.env
 .streamlit/secrets.toml
 backup_data.csv
+backup_data.meta.json
+real_yield_cache.csv
+*.log
+.migration_backup/

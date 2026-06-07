@@ -1,147 +1,125 @@
 # BTC Macro Signal Dashboard
 
-A Streamlit dashboard for analyzing Bitcoin price movement through macro market drivers, risk-on/risk-off regime detection, walk-forward alpha scoring, trading signals, and Sharpe-based backtesting.
+A Streamlit research dashboard for Bitcoin macro attribution, regime detection,
+walk-forward signal testing, and data-source monitoring.
 
-With a VPN or local proxy enabled, users in Mainland China can use this app to call Bitcoin and market data APIs directly.
+Repository: [mwsp-code/bitcoin-macro-dashboard](https://github.com/mwsp-code/bitcoin-macro-dashboard)
 
-## Features
+## Current Capabilities
 
-- Live BTC price data with multiple fallback sources: HTX/Huobi, OKX, Binance, and CoinGecko.
-- Macro market data from yfinance, including NASDAQ proxy, DXY, gold, and crude oil.
-- Real yield data from FRED using the 10-year TIPS real yield series.
-- Risk-on / risk-off regime detection.
-- BTC alpha score from 0 to 100.
-- Trading signal: `BUY`, `SELL`, or `NEUTRAL`.
-- Walk-forward next-day signal backtest.
-- Sharpe ratio, total return, max drawdown, and win-rate panels.
-- Transaction cost input in basis points per trade.
-- Cache support to avoid unnecessary API calls.
+- BTC daily prices from HTX with OKX, Binance, and CoinGecko fallbacks.
+- Preferred macro instruments from Yahoo:
+  - `QQQ`
+  - `DX-Y.NYB`
+  - `GC=F`
+  - `CL=F`
+- Consistent Nasdaq ETF fallback set when Yahoo is unavailable:
+  - `QQQ`
+  - `UUP`
+  - `GLD`
+  - `USO`
+- 10-year real yield from FRED `DFII10`, with an official U.S. Treasury fallback.
+- Weekend operation using the last published traditional-market observations.
+- Source timestamps, cache metadata, stale-data warnings, and historical mode.
+- Same-day attribution, random-forest feature importance, walk-forward
+  next-day signals, transaction costs, and backtest statistics.
 
-## What The Dashboard Does
+## Important Data Note
 
-The app pulls BTC and macro market data, aligns all series by date, then estimates how macro conditions may be influencing Bitcoin.
+`UUP`, `GLD`, and `USO` are fallback ETF proxies. They are not identical to
+DXY, COMEX gold futures, or WTI futures. When the fallback activates, the app
+uses the proxy set for the complete macro history instead of splicing two
+different instrument definitions.
 
-It separates the analysis into two layers:
-
-1. **Same-day attribution**
-   - Explains recent BTC movement using macro returns and changes.
-   - Shows model coefficients, feature importance, and driver attribution.
-
-2. **Next-day signal testing**
-   - Uses today's features to predict next-day BTC return.
-   - Trains models using walk-forward logic, so each signal only uses historical data available at that time.
-   - Optimizes alpha weights and buy/sell thresholds using prior data.
-   - Tests whether the resulting signal beats buy-and-hold after transaction costs.
-
-## Data Sources
-
-- BTC:
-  - HTX/Huobi
-  - OKX
-  - Binance
-  - CoinGecko
-- Macro:
-  - `QQQ` as a NASDAQ-100 proxy
-  - `DX-Y.NYB` for DXY
-  - `GC=F` for gold futures
-  - `CL=F` for WTI crude oil futures
-- Real yield:
-  - FRED `DFII10`
-
-## Mainland China VPN / Proxy Setup
-
-Crypto APIs and some market data sources may be blocked or unreliable from Mainland China without a VPN or proxy. The app keeps proxy usage off by default so it can run on Streamlit Cloud, where `127.0.0.1:7890` would not point to your local VPN.
-
-For local use in Mainland China, enable your VPN/proxy and set an environment variable before running Streamlit:
-
-```bash
-set BTC_PROXY_PORT=7890
-streamlit run btc_macro_htx.py
-```
-
-On PowerShell:
-
-```powershell
-$env:BTC_PROXY_PORT="7890"
-streamlit run btc_macro_htx.py
-```
-
-Common proxy ports:
-
-- Clash: `7890`
-- V2Ray: `10809`
-- Shadowsocks: `1080`
-
-Set `BTC_PROXY_PORT` to match your local VPN/proxy tool. If you are outside Mainland China, deploying on Streamlit Cloud, or do not need a proxy, leave `BTC_PROXY_PORT` unset.
-
-For Streamlit Cloud deployment, do not set `BTC_PROXY_PORT` unless your cloud environment provides a reachable proxy.
+See [Data Sources](docs/DATA_SOURCES.md) for details.
 
 ## Installation
 
-Create and activate a Python environment, then install the required packages:
+Python 3.11 is recommended.
 
-```bash
-pip install streamlit pandas numpy matplotlib scikit-learn requests yfinance
+```powershell
+git clone https://github.com/mwsp-code/bitcoin-macro-dashboard.git
+cd bitcoin-macro-dashboard
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-## Run The App
+For development:
 
-From the project folder:
-
-```bash
-streamlit run btc_macro_htx.py
+```powershell
+pip install -r requirements-dev.txt
 ```
 
-Then open the local Streamlit URL shown in your terminal.
+## Proxy Configuration
 
-## Signal Methodology
+The app checks settings in this order:
 
-### Regime Score
+1. `BTC_PROXY_URL`
+2. `BTC_PROXY_PORT`
+3. standard `HTTPS_PROXY`, `ALL_PROXY`, or `HTTP_PROXY` variables
+4. automatic detection of common local ports such as `7890`
 
-The regime score estimates whether the macro environment is more risk-on or risk-off for BTC. It uses walk-forward calibrated relationships between next-day BTC returns and macro features such as NASDAQ, DXY, real yields, and gold.
+PowerShell example:
 
-General interpretation:
+```powershell
+$env:BTC_PROXY_URL="http://127.0.0.1:7890"
+streamlit run app.py
+```
 
-- `58-100`: Risk-on
-- `42-58`: Mixed
-- `0-42`: Risk-off
+You may instead copy `.streamlit/secrets.toml.example` to
+`.streamlit/secrets.toml`. The real secrets file is ignored by Git.
 
-### BTC Alpha Score
+To use Yahoo's exact DXY, gold-futures, and oil-futures symbols, select a
+non-mainland VPN exit, enable global or TUN routing, and confirm that Yahoo does
+not return an empty response or HTTP 403. The application always prefers Yahoo
+when all four configured macro instruments are available.
 
-The alpha score is a 0 to 100 tactical score built from:
+## Run
 
-- Walk-forward model prediction
-- Calibrated macro regime component
-- BTC short-term momentum
+```powershell
+streamlit run app.py
+```
 
-General interpretation:
+## Validate
 
-- `65-100`: BUY
-- `35-65`: NEUTRAL
-- `0-35`: SELL
+```powershell
+python -m py_compile app.py
+pytest -q
+```
 
-The app optimizes alpha weights and buy/sell thresholds using only historical data available before each test period.
+CI runs the same compilation and offline smoke test for every pull request into
+`main`.
 
-## Backtest Notes
+## Model Outline
 
-The backtest is designed to be more realistic than a full-sample fit:
+The dashboard provides two related views:
 
-- Uses next-day BTC returns as the prediction target.
-- Uses walk-forward training.
-- Includes transaction cost assumptions.
-- Compares signal strategy performance against BTC buy-and-hold.
-- Reports Sharpe ratio, total return, max drawdown, and signal win rate.
+1. Same-day attribution fits BTC returns against contemporaneous and lagged
+   macro features.
+2. Walk-forward testing estimates next-day BTC returns using only prior
+   training observations for each evaluated date.
 
-The backtest is still experimental and should be treated as research, not a production trading system.
+The alpha layer combines model prediction, macro regime prediction, and
+seven-day BTC momentum. Signal weights and thresholds are periodically
+re-optimized on trailing data with transaction costs included.
 
-## Limitations
+This remains an experimental research model. Walk-forward evaluation reduces,
+but does not eliminate, overfitting and data-leakage risk.
 
-- Data sources can fail, rate-limit, or change their API behavior.
-- Daily data may not capture intraday BTC volatility.
-- Backtest results depend on transaction cost assumptions.
-- Walk-forward calibration reduces lookahead bias but does not eliminate overfitting risk.
-- Historical relationships between BTC and macro assets can break down.
+## Repository Workflow
+
+Use a branch and pull request for each iteration. See:
+
+- [Contributing](CONTRIBUTING.md)
+- [GitHub Workflow](docs/GITHUB_WORKFLOW.md)
+- [Roadmap](ROADMAP.md)
+- [Changelog](CHANGELOG.md)
+
+Generated cache files and local proxy secrets must not be committed.
 
 ## Disclaimer
 
-This project is for research and educational purposes only. It is not financial advice, investment advice, or a recommendation to buy or sell Bitcoin or any other asset. Always do your own research and consider the risks before trading.
+This project is for research and educational purposes only. It is not financial
+advice or a recommendation to buy or sell any asset.

@@ -2,21 +2,16 @@
 
 ## Phase 1: Reliability
 
-- Separate data acquisition, feature engineering, modeling, and UI modules.
 - Add source-contract tests for HTX, Nasdaq, Yahoo, FRED, and Treasury parsers.
 - Store cache metadata with instrument identity and schema version.
 - Add structured logging and a data-health summary.
 
 ## Phase 2: Prediction Quality
 
-- Create a true live inference row that does not require a known next-day target.
-- Align features by market close and publication timestamp in UTC.
-- Compare ordinary least squares with Ridge and ElasticNet.
-- Add nested walk-forward validation and an untouched final holdout period.
-- Report directional accuracy, information coefficient, calibration, turnover,
-  drawdown, and confidence intervals.
-- Test volatility, liquidity, ETF-flow, funding, basis, open-interest, and
-  stablecoin features only after publication-time alignment.
+- Add point-in-time ETF-flow, funding, basis, open-interest, options, and
+  stablecoin features after source licensing and timestamp validation.
+- Add formal probability calibration and Brier-score evaluation.
+- Add model-stability and feature-drift monitoring across market regimes.
 
 ## Phase 3: Trader Interface
 

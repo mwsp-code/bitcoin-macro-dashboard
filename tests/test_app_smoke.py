@@ -1,48 +1,50 @@
 from pathlib import Path
+import json
 import shutil
 
-import numpy as np
-import pandas as pd
 from streamlit.testing.v1 import AppTest
+
+from btc_dashboard.config import SCHEMA_VERSION
+from test_forecast_pipeline import synthetic_market_data
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def build_synthetic_cache(path):
-    rng = np.random.default_rng(42)
-    index = pd.date_range(
-        end=pd.Timestamp.now().normalize(),
-        periods=1_200,
-        freq="D",
-        name="time",
-    )
-
-    def random_walk(start, volatility):
-        shocks = rng.normal(0, volatility, len(index))
-        return start * np.exp(np.cumsum(shocks))
-
-    data = pd.DataFrame(
-        {
-            "BTC": random_walk(30_000, 0.02),
-            "NASDAQ": random_walk(350, 0.008),
-            "DXY": random_walk(100, 0.003),
-            "GOLD": random_walk(1_800, 0.006),
-            "OIL": random_walk(75, 0.015),
-            "REAL_YIELD": 1.5 + np.cumsum(rng.normal(0, 0.02, len(index))),
-        },
-        index=index,
-    )
-    data.to_csv(path)
-
-
 def test_dashboard_starts_from_complete_cache(tmp_path):
-    app_path = tmp_path / "app.py"
-    shutil.copy2(PROJECT_ROOT / "app.py", app_path)
-    build_synthetic_cache(tmp_path / "backup_data.csv")
+    shutil.copy2(PROJECT_ROOT / "app.py", tmp_path / "app.py")
+    shutil.copytree(PROJECT_ROOT / "btc_dashboard", tmp_path / "btc_dashboard")
+    data = synthetic_market_data(periods=900)
+    data.index = __import__("pandas").date_range(
+        end=__import__("pandas").Timestamp.now().normalize()
+        - __import__("pandas").Timedelta(days=1),
+        periods=len(data),
+        freq="D",
+    )
+    data.to_csv(tmp_path / "backup_data.csv")
+    metadata = {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at_utc": str(__import__("pandas").Timestamp.utcnow()),
+        "btc_source": "synthetic cache",
+        "status": {
+            "BTC": "cache",
+            "NASDAQ": "cache",
+            "DXY": "cache",
+            "GOLD": "cache",
+            "OIL": "cache",
+            "REAL_YIELD": "cache",
+        },
+        "timestamps": {
+            name: str(data.index[-1])
+            for name in ("BTC", "NASDAQ", "DXY", "GOLD", "OIL", "REAL_YIELD")
+        },
+    }
+    (tmp_path / "backup_data.meta.json").write_text(
+        json.dumps(metadata), encoding="utf-8"
+    )
 
-    app = AppTest.from_file(str(app_path), default_timeout=120)
-    app.run(timeout=120)
+    app = AppTest.from_file(str(tmp_path / "app.py"), default_timeout=180)
+    app.run(timeout=180)
 
     assert not app.exception
     assert not app.error

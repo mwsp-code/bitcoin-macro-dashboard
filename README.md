@@ -7,7 +7,8 @@ Repository: [mwsp-code/bitcoin-macro-dashboard](https://github.com/mwsp-code/bit
 
 ## Current Capabilities
 
-- BTC daily prices from HTX with OKX, Binance, and CoinGecko fallbacks.
+- Binance BTC/USDT completed UTC daily OHLCV candles, with HTX, OKX, and
+  CoinGecko fallbacks in that order.
 - Preferred macro instruments from Yahoo:
   - `QQQ`
   - `DX-Y.NYB`
@@ -21,8 +22,11 @@ Repository: [mwsp-code/bitcoin-macro-dashboard](https://github.com/mwsp-code/bit
 - 10-year real yield from FRED `DFII10`, with an official U.S. Treasury fallback.
 - Weekend operation using the last published traditional-market observations.
 - Source timestamps, cache metadata, stale-data warnings, and historical mode.
-- Same-day attribution, random-forest feature importance, walk-forward
-  next-day signals, transaction costs, and backtest statistics.
+- Session-aware macro features, crypto-native price/volume features, and a
+  genuine live next-day inference row.
+- Nested walk-forward Ridge/ElasticNet selection with a frozen final holdout.
+- Baseline comparisons, block-bootstrap confidence intervals, transaction
+  costs, and out-of-sample evaluation statistics.
 
 ## Important Data Note
 
@@ -92,18 +96,31 @@ pytest -q
 CI runs the same compilation and offline smoke test for every pull request into
 `main`.
 
+## Architecture
+
+- `btc_dashboard/data.py`: completed-bar market data, source fallback, caching,
+  observation timestamps, and freshness.
+- `btc_dashboard/features.py`: native-session macro lags and crypto features.
+- `btc_dashboard/models.py`: nested tuning, frozen holdout, live inference,
+  and same-day attribution.
+- `btc_dashboard/backtest.py`: baselines, confidence intervals, and strategy
+  evaluation.
+- `btc_dashboard/ui.py`: Streamlit presentation only.
+
 ## Model Outline
 
 The dashboard provides two related views:
 
-1. Same-day attribution fits BTC returns against contemporaneous and lagged
-   macro features.
-2. Walk-forward testing estimates next-day BTC returns using only prior
-   training observations for each evaluated date.
-
-The alpha layer combines model prediction, macro regime prediction, and
-seven-day BTC momentum. Signal weights and thresholds are periodically
-re-optimized on trailing data with transaction costs included.
+1. Same-day attribution uses regularized macro coefficients on active market
+   sessions and is explicitly descriptive rather than causal.
+2. Next-day prediction uses completed BTC candles, native-session macro
+   changes, market-data age, momentum, volatility, range, volume, trade-count,
+   and taker-flow features when Binance supplies them.
+3. Development predictions use nested time-series validation. Model
+   specification is frozen before the final holdout, then refitted only on
+   information available before each prediction.
+4. The latest completed candle produces a separate live forecast whose target
+   is still unknown.
 
 This remains an experimental research model. Walk-forward evaluation reduces,
 but does not eliminate, overfitting and data-leakage risk.

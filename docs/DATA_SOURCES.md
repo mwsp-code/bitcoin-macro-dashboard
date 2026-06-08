@@ -4,7 +4,7 @@
 
 | Dataset | Preferred source | Fallback | Notes |
 | --- | --- | --- | --- |
-| Bitcoin | HTX | OKX, Binance, CoinGecko | Daily BTC/USDT close |
+| Bitcoin | Binance | HTX, OKX, CoinGecko | Completed UTC BTC/USDT OHLCV candles |
 | Nasdaq | Yahoo `QQQ` | Nasdaq `QQQ` | Same ETF instrument |
 | U.S. dollar | Yahoo `DX-Y.NYB` | Nasdaq `UUP` | UUP is an ETF proxy, not DXY |
 | Gold | Yahoo `GC=F` | Nasdaq `GLD` | GLD is an ETF proxy, not COMEX futures |
@@ -26,6 +26,18 @@ Bitcoin trades every day. Traditional-market and macro series do not. The app
 forward-fills the latest published observation for weekend scoring and retains
 the source's true publication date. A forward-filled value is availability
 handling, not a new market observation.
+
+Macro returns and lagged returns are calculated on each instrument's native
+observed sessions before being carried onto the daily Bitcoin calendar.
+Therefore Monday's previous-session feature refers to Friday, not a synthetic
+Sunday zero.
+
+## Completed Bitcoin Bars
+
+Binance candles are accepted only after their exchange-provided close
+timestamp has passed. OKX requires the candle confirmation flag, and HTX and
+CoinGecko observations are restricted to dates before the current UTC date.
+The current incomplete UTC candle is never used as a training target.
 
 ## Cache Files
 

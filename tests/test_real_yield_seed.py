@@ -1,44 +1,42 @@
-import ast
-from pathlib import Path
+import shutil
 
 import pandas as pd
 
+from btc_dashboard.config import DataPaths
+from btc_dashboard.data import read_real_yield_fallback
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-
-def load_fallback_functions():
-    app_path = PROJECT_ROOT / "app.py"
-    tree = ast.parse(app_path.read_text(encoding="utf-8"))
-    required = {
-        "normalize_daily_index",
-        "clean_real_yield",
-        "read_real_yield_fallback",
-    }
-    functions = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in required
-    ]
-    namespace = {
-        "pd": pd,
-        "REAL_YIELD_CACHE_FILE": PROJECT_ROOT / "missing-runtime-cache.csv",
-        "REAL_YIELD_SEED_FILE": PROJECT_ROOT / "data" / "real_yield_seed.csv",
-        "CACHE_FILE": PROJECT_ROOT / "missing-complete-cache.csv",
-    }
-    exec(
-        compile(ast.Module(body=functions, type_ignores=[]), str(app_path), "exec"),
-        namespace,
+def test_bundled_seed_survives_cold_start(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    source = (
+        DataPaths(__import__("pathlib").Path(__file__).resolve().parents[1])
+        .real_yield_seed_file
     )
-    return namespace["read_real_yield_fallback"]
+    shutil.copy2(source, data_dir / "real_yield_seed.csv")
 
-
-def test_bundled_seed_survives_streamlit_cold_start():
-    read_fallback = load_fallback_functions()
-    series, label, errors = read_fallback()
+    series, label, errors = read_real_yield_fallback(DataPaths(tmp_path))
 
     assert label == "bundled official seed"
     assert series.name == "REAL_YIELD"
     assert series.index[-1] == pd.Timestamp("2026-06-05")
     assert float(series.iloc[-1]) == 2.19
     assert not errors
+
+
+def test_newer_complete_cache_beats_older_seed(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    pd.DataFrame(
+        {"REAL_YIELD": [2.0]},
+        index=[pd.Timestamp("2026-06-05")],
+    ).to_csv(data_dir / "real_yield_seed.csv")
+    pd.DataFrame(
+        {"REAL_YIELD": [2.1]},
+        index=[pd.Timestamp("2026-06-08")],
+    ).to_csv(tmp_path / "backup_data.csv")
+
+    series, label, _ = read_real_yield_fallback(DataPaths(tmp_path))
+
+    assert label == "complete-data cache"
+    assert series.index[-1] == pd.Timestamp("2026-06-08")

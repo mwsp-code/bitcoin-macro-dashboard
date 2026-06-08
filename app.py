@@ -12,9 +12,12 @@ import os
 import sys
 import time
 from pathlib import Path
+from real_yield_data import load_real_yield
 
 BASE_DIR      = Path(__file__).resolve().parent
 CACHE_FILE    = BASE_DIR / "backup_data.csv"
+REAL_YIELD_CACHE_FILE = BASE_DIR / "real_yield_cache.csv"
+REAL_YIELD_SEED_FILE = BASE_DIR / "data" / "real_yield_seed.csv"
 CACHE_MAX_AGE = 23   # hours
 TRADING_DAYS_PER_YEAR = 365
 WALK_FORWARD_MIN_TRAIN = 365
@@ -377,22 +380,21 @@ def load_data(force_refresh=False):
     for name, series in macro_series.items():
         data[name] = series
 
-    # ── FRED REAL YIELD ──────────────────────
-    try:
-        ry = pd.read_csv("https://fred.stlouisfed.org/graph/fredgraph.csv?id=DFII10", index_col=0, parse_dates=True)
-        ry.index = pd.to_datetime(ry.index).tz_localize(None).normalize()
-
-        ry.columns = ["REAL_YIELD"]
-        ry.index = pd.to_datetime(ry.index).normalize()
-        ry = ry[ry["REAL_YIELD"] != "."]
-        ry["REAL_YIELD"] = ry["REAL_YIELD"].astype(float)
+    # ── FRED / TREASURY REAL YIELD ──────────
+    ry, ry_status, ry_timestamp, ry_errors = load_real_yield(
+        SESSION,
+        REAL_YIELD_CACHE_FILE,
+        REAL_YIELD_SEED_FILE,
+    )
+    status["REAL_YIELD"] = ry_status
+    if ry_timestamp is not None:
+        timestamps["REAL_YIELD"] = ry_timestamp
+    if ry_errors:
+        status["_real_yield_errors"] = "\n".join(ry_errors)
+    if ry is not None:
         if "REAL_YIELD" in data.columns:
             data = data.drop(columns=["REAL_YIELD"])
-        data = data.join(ry, how="left")
-        status["REAL_YIELD"] = "live"
-        timestamps["REAL_YIELD"] = ry.index[-1]
-    except Exception as e:
-        status["REAL_YIELD"] = f"failed ({type(e).__name__}: {e})"
+        data = data.join(ry.to_frame(), how="left")
 
     missing_live = [c for c in REQUIRED_COLS if c not in data.columns]
     if missing_live:
@@ -460,13 +462,35 @@ for k, v in status.items():
     elif k == "_btc_errors":
         with st.sidebar.expander("🔍 BTC source errors"):
             st.text(v)
+    elif k == "_real_yield_errors":
+        with st.sidebar.expander("Real-yield source errors"):
+            st.text(v)
     else:
-        icon = "✅" if any(x in str(v) for x in ["live", "cache"]) else "❌"
+        status_text = str(v).lower()
+        if status_text.startswith("live"):
+            icon = "✅"
+        elif "stale" in status_text:
+            icon = "⚠️"
+        elif "cache" in status_text:
+            icon = "ℹ️"
+        else:
+            icon = "❌"
         st.sidebar.write(f"{icon} {k}: {v}")
 
 st.sidebar.write("### 🕒 Freshness")
 for k, t in timestamps.items():
     st.sidebar.write(f"{k}: {t}")
+real_yield_as_of = timestamps.get("REAL_YIELD")
+if real_yield_as_of is not None:
+    real_yield_age = (
+        pd.Timestamp.now().normalize()
+        - pd.Timestamp(real_yield_as_of).normalize()
+    ).days
+    if real_yield_age > 4:
+        st.sidebar.warning(
+            f"Real yield is {real_yield_age} calendar days old; "
+            "the last official observation is being carried forward."
+        )
 st.sidebar.write(f"🕒 Run Time: {datetime.now().strftime('%H:%M:%S')}")
 st.sidebar.write(f"📊 Observations: {len(data)}")
 

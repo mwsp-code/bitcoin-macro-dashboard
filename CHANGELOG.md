@@ -25,3 +25,5 @@ All notable changes to this project will be documented here.
 
 - Weekend launches no longer fail only because FRED has no new observation.
 - Old complete caches are no longer presented as current live signals.
+- Streamlit cold starts retain `REAL_YIELD` through a bundled official seed
+  when FRED and Treasury are temporarily unavailable.

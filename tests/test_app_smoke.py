@@ -5,7 +5,7 @@ import shutil
 from streamlit.testing.v1 import AppTest
 
 from btc_dashboard.config import SCHEMA_VERSION
-from test_forecast_pipeline import synthetic_market_data
+from tests.helpers import synthetic_market_data
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

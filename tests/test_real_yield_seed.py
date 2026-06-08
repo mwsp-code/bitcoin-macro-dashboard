@@ -1,4 +1,5 @@
 import shutil
+from pathlib import Path
 
 import pandas as pd
 
@@ -9,10 +10,7 @@ from btc_dashboard.data import read_real_yield_fallback
 def test_bundled_seed_survives_cold_start(tmp_path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    source = (
-        DataPaths(__import__("pathlib").Path(__file__).resolve().parents[1])
-        .real_yield_seed_file
-    )
+    source = DataPaths(Path(__file__).resolve().parents[1]).real_yield_seed_file
     shutil.copy2(source, data_dir / "real_yield_seed.csv")
 
     series, label, errors = read_real_yield_fallback(DataPaths(tmp_path))

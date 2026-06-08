@@ -1,9 +1,10 @@
 from dataclasses import dataclass
 from math import erf, sqrt
+import warnings
 
 import numpy as np
 import pandas as pd
-from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import TimeSeriesSplit
@@ -38,10 +39,12 @@ class ForecastResult:
     live_probability_up: float
     frozen_spec: ModelSpec
     coefficients: pd.Series
+    standardized_coefficients: pd.Series
     intercept: float
     residual_std: float
     holdout_start: pd.Timestamp
     tuning_history: pd.DataFrame
+    validation_comparison: pd.DataFrame
 
 
 @dataclass
@@ -59,7 +62,7 @@ def candidate_specs():
     specs = [ModelSpec("ridge", alpha) for alpha in (0.1, 1.0, 10.0, 100.0)]
     specs.extend(
         ModelSpec("elastic_net", alpha, l1_ratio)
-        for alpha in (0.0001, 0.001, 0.01)
+        for alpha in (0.000001, 0.00001, 0.0001, 0.001, 0.01)
         for l1_ratio in (0.1, 0.5, 0.9)
     )
     return specs
@@ -70,7 +73,8 @@ def make_estimator(spec):
         model = ElasticNet(
             alpha=spec.alpha,
             l1_ratio=spec.l1_ratio,
-            max_iter=20_000,
+            max_iter=5_000,
+            tol=5e-3,
             selection="cyclic",
         )
     else:
@@ -85,8 +89,24 @@ def _inner_cv_score(x, y, spec, splits, gap):
     fold_scores = []
     for train_idx, validation_idx in splitter.split(x):
         estimator = make_estimator(spec)
-        estimator.fit(x.iloc[train_idx], y.iloc[train_idx])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ConvergenceWarning)
+            try:
+                estimator.fit(x.iloc[train_idx], y.iloc[train_idx])
+            except ConvergenceWarning:
+                return np.inf
         prediction = estimator.predict(x.iloc[validation_idx])
+        fold_scores.append(mean_absolute_error(y.iloc[validation_idx], prediction))
+    return float(np.mean(fold_scores))
+
+
+def _zero_return_cv_score(x, y, splits, gap):
+    if len(x) < max(60, splits * 20):
+        return np.inf
+    splitter = TimeSeriesSplit(n_splits=splits, gap=gap)
+    fold_scores = []
+    for _, validation_idx in splitter.split(x):
+        prediction = np.zeros(len(validation_idx))
         fold_scores.append(mean_absolute_error(y.iloc[validation_idx], prediction))
     return float(np.mean(fold_scores))
 
@@ -105,23 +125,62 @@ def select_spec(x, y, config):
     return min(scores, key=scores.get), scores
 
 
-def _raw_coefficients(estimator, columns):
+def _coefficient_views(estimator, columns):
     scaler = estimator.named_steps["scale"]
     model = estimator.named_steps["model"]
+    standardized = pd.Series(
+        model.coef_,
+        index=columns,
+        name="Standardized Coefficient",
+    )
     raw = model.coef_ / scaler.scale_
     intercept = float(model.intercept_ - np.dot(raw, scaler.mean_))
-    return pd.Series(raw, index=columns, name="Coefficient"), intercept
+    return (
+        pd.Series(raw, index=columns, name="Raw Coefficient"),
+        standardized,
+        intercept,
+    )
+
+
+def _validation_comparison(scores, zero_mae, selected_spec):
+    rows = []
+    for spec, score in scores.items():
+        converged = np.isfinite(score)
+        rows.append(
+            {
+                "Candidate": spec.label,
+                "Validation MAE": score if converged else np.nan,
+                "MAE vs Zero": score - zero_mae if converged else np.nan,
+                "Improvement vs Zero": (
+                    (zero_mae - score) / zero_mae
+                    if converged and zero_mae > 0
+                    else np.nan
+                ),
+                "Status": "Converged" if converged else "Did not converge",
+                "Selected": spec == selected_spec,
+            }
+        )
+    rows.append(
+        {
+            "Candidate": "Zero-return baseline",
+            "Validation MAE": zero_mae,
+            "MAE vs Zero": 0.0,
+            "Improvement vs Zero": 0.0,
+            "Status": "Baseline",
+            "Selected": False,
+        }
+    )
+    return (
+        pd.DataFrame(rows)
+        .set_index("Candidate")
+        .sort_values("Validation MAE")
+    )
 
 
 def _historical_baselines(y_train, x_row):
     historical_mean = float(y_train.tail(90).mean())
     momentum = float(x_row.get("BTC_RETURN_7D", 0.0) / 7)
     return historical_mean, momentum
-
-
-def _fit_predict(estimator, x_train, y_train, x_row):
-    fitted = clone(estimator).fit(x_train, y_train)
-    return float(fitted.predict(x_row.to_frame().T)[0]), fitted
 
 
 def build_forecast(feature_set, config=None):
@@ -141,13 +200,18 @@ def build_forecast(feature_set, config=None):
     tuning_rows = []
     active_spec = None
     last_tuned = None
+    development_estimator = None
+    last_development_refit = None
 
     for position in range(config.min_train_days, holdout_position):
         start = max(0, position - config.train_window_days)
         x_train = x.iloc[start:position]
         y_train = y.iloc[start:position]
+        specification_changed = False
         if active_spec is None or position - last_tuned >= config.tune_every_days:
-            active_spec, scores = select_spec(x_train, y_train, config)
+            selected_spec, scores = select_spec(x_train, y_train, config)
+            specification_changed = selected_spec != active_spec
+            active_spec = selected_spec
             tuning_rows.append(
                 {
                     "date": x.index[position],
@@ -156,8 +220,18 @@ def build_forecast(feature_set, config=None):
                 }
             )
             last_tuned = position
-        prediction, _ = _fit_predict(
-            make_estimator(active_spec), x_train, y_train, x.iloc[position]
+        if (
+            development_estimator is None
+            or specification_changed
+            or position - last_development_refit >= config.refit_every_days
+        ):
+            development_estimator = make_estimator(active_spec).fit(
+                x_train,
+                y_train,
+            )
+            last_development_refit = position
+        prediction = float(
+            development_estimator.predict(x.iloc[[position]])[0]
         )
         mean_baseline, momentum_baseline = _historical_baselines(
             y_train, x.iloc[position]
@@ -182,6 +256,17 @@ def build_forecast(feature_set, config=None):
         y.iloc[final_train_start:holdout_position],
         config,
     )
+    zero_validation_mae = _zero_return_cv_score(
+        x.iloc[final_train_start:holdout_position],
+        y.iloc[final_train_start:holdout_position],
+        splits=config.inner_splits,
+        gap=config.validation_gap_days,
+    )
+    validation_comparison = _validation_comparison(
+        final_scores,
+        zero_validation_mae,
+        frozen_spec,
+    )
     tuning_rows.append(
         {
             "date": holdout_start,
@@ -191,13 +276,22 @@ def build_forecast(feature_set, config=None):
         }
     )
 
+    holdout_estimator = None
+    last_holdout_refit = None
     for position in range(holdout_position, len(x)):
         start = max(0, position - config.train_window_days)
         x_train = x.iloc[start:position]
         y_train = y.iloc[start:position]
-        prediction, _ = _fit_predict(
-            make_estimator(frozen_spec), x_train, y_train, x.iloc[position]
-        )
+        if (
+            holdout_estimator is None
+            or position - last_holdout_refit >= config.refit_every_days
+        ):
+            holdout_estimator = make_estimator(frozen_spec).fit(
+                x_train,
+                y_train,
+            )
+            last_holdout_refit = position
+        prediction = float(holdout_estimator.predict(x.iloc[[position]])[0])
         mean_baseline, momentum_baseline = _historical_baselines(
             y_train, x.iloc[position]
         )
@@ -244,7 +338,7 @@ def build_forecast(feature_set, config=None):
     else:
         z_value = live_prediction / residual_std
         probability_up = 0.5 * (1 + erf(z_value / sqrt(2)))
-    coefficients, intercept = _raw_coefficients(
+    coefficients, standardized_coefficients, intercept = _coefficient_views(
         live_estimator, feature_set.features.columns
     )
     live_feature_date = feature_set.inference_features.index[-1]
@@ -256,10 +350,12 @@ def build_forecast(feature_set, config=None):
         live_probability_up=float(probability_up),
         frozen_spec=frozen_spec,
         coefficients=coefficients,
+        standardized_coefficients=standardized_coefficients,
         intercept=intercept,
         residual_std=residual_std,
         holdout_start=holdout_start,
         tuning_history=pd.DataFrame(tuning_rows).set_index("date"),
+        validation_comparison=validation_comparison,
     )
 
 
@@ -273,7 +369,7 @@ def fit_same_day_attribution(feature_set, alpha=1.0):
     x = frame[feature_columns]
     y = frame["BTC_LOG_RETURN"]
     estimator = make_estimator(ModelSpec("ridge", alpha)).fit(x, y)
-    coefficients, intercept = _raw_coefficients(estimator, feature_columns)
+    coefficients, _, intercept = _coefficient_views(estimator, feature_columns)
     latest = x.iloc[-1]
     fitted = float(estimator.predict(latest.to_frame().T)[0])
     actual = float(y.iloc[-1])

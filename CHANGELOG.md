@@ -14,6 +14,8 @@ All notable changes to this project will be documented here.
   180-day holdout.
 - Zero-return, rolling-mean, momentum, and always-up baselines with
   moving-block bootstrap confidence intervals.
+- Standardized coefficient reporting, explicit intercept-only model status,
+  and a full candidate validation-MAE comparison against zero return.
 - Automatic detection of common local proxy ports.
 - Nasdaq ETF macro fallback using QQQ, UUP, GLD, and USO.
 - U.S. Treasury fallback for the 10-year real yield.

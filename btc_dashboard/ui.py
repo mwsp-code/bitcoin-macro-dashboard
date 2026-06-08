@@ -148,12 +148,58 @@ def render_dashboard(
         with st.expander("Nested tuning history"):
             st.dataframe(forecast.tuning_history, width="stretch")
 
+        st.subheader("Candidate Validation MAE")
+        validation_display = forecast.validation_comparison.copy()
+        validation_display["Validation MAE"] = validation_display[
+            "Validation MAE"
+        ].map(lambda value: "n/a" if pd.isna(value) else f"{value:.6f}")
+        validation_display["MAE vs Zero"] = validation_display[
+            "MAE vs Zero"
+        ].map(lambda value: "n/a" if pd.isna(value) else f"{value:+.6f}")
+        validation_display["Improvement vs Zero"] = validation_display[
+            "Improvement vs Zero"
+        ].map(lambda value: "n/a" if pd.isna(value) else f"{value:+.2%}")
+        st.dataframe(validation_display, width="stretch")
+        st.caption(
+            "Negative MAE vs Zero and positive improvement indicate a candidate "
+            "beat the zero-return baseline on the same inner time-series folds."
+        )
+
     with drivers:
-        st.subheader("Live Regularized Forecast Coefficients")
-        coefficient_table = forecast.coefficients.reindex(
-            forecast.coefficients.abs().sort_values(ascending=False).index
+        st.subheader("Model Coefficients")
+        nonzero_count = int(
+            (forecast.standardized_coefficients.abs() > 1e-12).sum()
+        )
+        st.caption(f"Selected specification: `{forecast.frozen_spec.label}`")
+        coefficient_metrics = st.columns(2)
+        coefficient_metrics[0].metric(
+            "Intercept",
+            f"{forecast.intercept:+.6f}",
+        )
+        coefficient_metrics[1].metric(
+            "Non-Zero Features",
+            f"{nonzero_count}/{len(forecast.standardized_coefficients)}",
+        )
+        if nonzero_count == 0:
+            st.info(
+                "Intercept-only model selected. Validation preferred shrinking "
+                "every feature coefficient to zero; no artificial driver is shown."
+            )
+        coefficient_table = forecast.standardized_coefficients.reindex(
+            forecast.standardized_coefficients.abs().sort_values(
+                ascending=False
+            ).index
         ).to_frame()
         st.dataframe(coefficient_table.head(25), width="stretch")
+        st.caption(
+            "Standardized coefficients show the expected target-return change "
+            "for a one-standard-deviation feature move."
+        )
+        with st.expander("Raw coefficients by original feature units"):
+            raw_table = forecast.coefficients.reindex(
+                forecast.coefficients.abs().sort_values(ascending=False).index
+            ).to_frame()
+            st.dataframe(raw_table, width="stretch")
 
         st.subheader("Latest Same-Day Macro Attribution")
         st.caption(

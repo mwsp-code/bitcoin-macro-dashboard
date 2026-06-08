@@ -45,7 +45,8 @@ class ModelConfig:
     min_train_days: int = 365
     train_window_days: int = 730
     holdout_days: int = 180
-    tune_every_days: int = 30
+    tune_every_days: int = 90
+    refit_every_days: int = 7
     inner_splits: int = 4
     validation_gap_days: int = 1
     bootstrap_samples: int = 400

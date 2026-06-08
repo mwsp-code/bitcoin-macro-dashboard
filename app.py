@@ -20,6 +20,7 @@ BASE_DIR      = Path(__file__).resolve().parent
 CACHE_FILE    = BASE_DIR / "backup_data.csv"
 CACHE_METADATA_FILE = BASE_DIR / "backup_data.meta.json"
 REAL_YIELD_CACHE_FILE = BASE_DIR / "real_yield_cache.csv"
+REAL_YIELD_SEED_FILE = BASE_DIR / "data" / "real_yield_seed.csv"
 CACHE_MAX_AGE = 23   # hours
 REAL_YIELD_WARNING_AGE_DAYS = 4
 TRADING_DAYS_PER_YEAR = 365
@@ -530,6 +531,7 @@ def read_real_yield_fallback():
     """Use an exact last-known FRED observation; never estimate the yield."""
     candidates = [
         (REAL_YIELD_CACHE_FILE, "real-yield cache"),
+        (REAL_YIELD_SEED_FILE, "bundled official seed"),
         (CACHE_FILE, "complete-data cache"),
     ]
     errors = []

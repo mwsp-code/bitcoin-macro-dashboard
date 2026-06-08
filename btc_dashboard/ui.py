@@ -1,6 +1,7 @@
 from datetime import datetime
 
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, StrMethodFormatter
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -17,6 +18,86 @@ def _signal_label(prediction, cost_bps):
     if prediction < -threshold:
         return "SHORT"
     return "FLAT"
+
+
+def build_holdout_wealth(holdout_strategy, btc_returns, initial_capital=10_000):
+    aligned = pd.concat(
+        [
+            pd.Series(holdout_strategy, name="Model Strategy"),
+            pd.Series(btc_returns, name="BTC Buy & Hold"),
+        ],
+        axis=1,
+    ).dropna()
+    wealth = initial_capital * np.exp(aligned.cumsum())
+    starting_date = wealth.index[0] - pd.Timedelta(days=1)
+    starting_row = pd.DataFrame(
+        initial_capital,
+        index=[starting_date],
+        columns=wealth.columns,
+    )
+    wealth = pd.concat([starting_row, wealth])
+    drawdown = wealth.div(wealth.cummax()).sub(1)
+    return wealth, drawdown
+
+
+def plot_holdout_wealth(wealth, drawdown):
+    colors = {
+        "Model Strategy": "#087E8B",
+        "BTC Buy & Hold": "#F0A202",
+    }
+    figure, axes = plt.subplots(
+        2,
+        1,
+        figsize=(11, 6.5),
+        sharex=True,
+        gridspec_kw={"height_ratios": [2.4, 1]},
+    )
+    wealth_axis, drawdown_axis = axes
+    for column in wealth:
+        wealth_axis.plot(
+            wealth.index,
+            wealth[column],
+            label=column,
+            color=colors[column],
+            linewidth=2,
+        )
+        wealth_axis.annotate(
+            f"${wealth[column].iloc[-1]:,.0f}",
+            xy=(wealth.index[-1], wealth[column].iloc[-1]),
+            xytext=(6, 0),
+            textcoords="offset points",
+            va="center",
+            color=colors[column],
+            fontsize=9,
+        )
+    wealth_axis.axhline(
+        wealth.iloc[0].mean(),
+        color="#808080",
+        linewidth=0.8,
+        linestyle="--",
+        alpha=0.7,
+    )
+    wealth_axis.set_ylabel("Portfolio value")
+    wealth_axis.yaxis.set_major_formatter(StrMethodFormatter("${x:,.0f}"))
+    wealth_axis.legend(loc="upper left", frameon=False)
+    wealth_axis.grid(axis="y", alpha=0.2)
+
+    for column in drawdown:
+        drawdown_axis.plot(
+            drawdown.index,
+            drawdown[column],
+            label=column,
+            color=colors[column],
+            linewidth=1.5,
+        )
+    drawdown_axis.axhline(0, color="#808080", linewidth=0.8)
+    drawdown_axis.set_ylabel("Drawdown")
+    drawdown_axis.yaxis.set_major_formatter(
+        FuncFormatter(lambda value, _: f"{value:.0%}")
+    )
+    drawdown_axis.grid(axis="y", alpha=0.2)
+    figure.tight_layout()
+    return figure
 
 
 def render_dashboard(
@@ -55,6 +136,17 @@ def render_dashboard(
         f"Forecast target {forecast.live_target_date:%Y-%m-%d} | "
         f"Model {forecast.frozen_spec.label}"
     )
+    st.markdown(
+        "**Purpose.** Test whether completed Bitcoin market activity and "
+        "lagged macro signals contain robust information about next-day BTC "
+        "returns.  \n"
+        "**Method.** Binance-first completed UTC candles, session-aware macro "
+        "features, nested Ridge/ElasticNet tuning, transaction costs, and a "
+        "frozen holdout period that is not used for model selection.  \n"
+        "**Interpretation.** Forecasts are shown as research evidence, and the "
+        "dashboard withholds a trade signal when the model lacks validated "
+        "out-of-sample edge."
+    )
 
     top = st.columns(6)
     top[0].metric("BTC Close", f"${latest_price:,.0f}")
@@ -92,31 +184,76 @@ def render_dashboard(
         st.subheader("Forecast Monitor")
         st.line_chart(chart_frame)
 
-        left, right = st.columns(2)
-        with left:
-            st.subheader("Frozen Holdout Equity")
-            holdout_strategy = strategy_returns[
-                "Frozen Holdout: Regularized Model"
-            ]
-            equity = pd.DataFrame(
-                {
-                    "Model Strategy": holdout_strategy.cumsum().apply(np.exp),
-                    "BTC Buy & Hold": holdout["actual"].cumsum().apply(np.exp),
-                }
-            )
-            st.line_chart(equity)
-        with right:
-            st.subheader("Recent Forecasts")
-            recent = holdout[
-                ["actual", "model", "historical_mean", "momentum_7d"]
-            ].tail(20)
-            recent.columns = [
-                "Actual",
-                "Model",
-                "Rolling Mean",
-                "7D Momentum",
-            ]
-            st.dataframe(recent, width="stretch")
+        st.subheader("Growth of $10,000 on Unseen Holdout Data")
+        st.caption(
+            f"Frozen evaluation period: {holdout.index.min():%Y-%m-%d} to "
+            f"{holdout.index.max():%Y-%m-%d}. The model specification was "
+            "locked before this period. The model path includes the selected "
+            f"{transaction_cost_bps:.0f} bps trading-cost assumption; BTC is "
+            "shown as passive buy-and-hold."
+        )
+        holdout_strategy = strategy_returns[
+            "Frozen Holdout: Regularized Model"
+        ]
+        wealth, drawdown = build_holdout_wealth(
+            holdout_strategy,
+            holdout["actual"],
+        )
+        model_end = float(wealth["Model Strategy"].iloc[-1])
+        btc_end = float(wealth["BTC Buy & Hold"].iloc[-1])
+        model_drawdown = float(drawdown["Model Strategy"].min())
+        btc_drawdown = float(drawdown["BTC Buy & Hold"].min())
+        holdout_metrics = st.columns(4)
+        holdout_metrics[0].metric("Starting Capital", "$10,000")
+        holdout_metrics[1].metric(
+            "Model Ending Value",
+            f"${model_end:,.0f}",
+            delta=f"{model_end / 10_000 - 1:+.1%}",
+        )
+        holdout_metrics[2].metric(
+            "BTC Ending Value",
+            f"${btc_end:,.0f}",
+            delta=f"{btc_end / 10_000 - 1:+.1%}",
+        )
+        holdout_metrics[3].metric(
+            "Model vs BTC",
+            f"${model_end - btc_end:+,.0f}",
+            delta=f"DD {model_drawdown:.1%} vs {btc_drawdown:.1%}",
+        )
+        relative_result = (
+            f"outperformed passive BTC by ${model_end - btc_end:,.0f}"
+            if model_end >= btc_end
+            else f"underperformed passive BTC by ${btc_end - model_end:,.0f}"
+        )
+        absolute_result = (
+            "Both portfolios finished below the starting capital."
+            if model_end < 10_000 and btc_end < 10_000
+            else "At least one portfolio finished above the starting capital."
+        )
+        st.markdown(
+            f"**Holdout takeaway.** The model {relative_result}. "
+            f"{absolute_result}"
+        )
+        holdout_figure = plot_holdout_wealth(wealth, drawdown)
+        st.pyplot(holdout_figure)
+        plt.close(holdout_figure)
+        st.caption(
+            "Top: portfolio value from the same $10,000 starting capital. "
+            "Bottom: percentage decline from each strategy's previous peak; "
+            "shallower drawdowns indicate lower realized downside."
+        )
+
+        st.subheader("Recent Holdout Forecasts")
+        recent = holdout[
+            ["actual", "model", "historical_mean", "momentum_7d"]
+        ].tail(20)
+        recent.columns = [
+            "Actual",
+            "Model",
+            "Rolling Mean",
+            "7D Momentum",
+        ]
+        st.dataframe(recent, width="stretch")
 
     with evaluation_tab:
         st.subheader("Out-of-Sample Evaluation")

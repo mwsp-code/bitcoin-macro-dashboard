@@ -16,6 +16,8 @@ All notable changes to this project will be documented here.
   moving-block bootstrap confidence intervals.
 - Standardized coefficient reporting, explicit intercept-only model status,
   and a full candidate validation-MAE comparison against zero return.
+- A concise on-dashboard research summary and an intuitive $10,000 frozen
+  holdout comparison with ending values and drawdown.
 - Automatic detection of common local proxy ports.
 - Nasdaq ETF macro fallback using QQQ, UUP, GLD, and USO.
 - U.S. Treasury fallback for the 10-year real yield.

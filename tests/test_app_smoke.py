@@ -48,3 +48,15 @@ def test_dashboard_starts_from_complete_cache(tmp_path):
 
     assert not app.exception
     assert not app.error
+    assert any(
+        "Test whether completed Bitcoin market activity" in str(element.value)
+        for element in app.markdown
+    )
+    assert any(
+        element.value == "Growth of $10,000 on Unseen Holdout Data"
+        for element in app.subheader
+    )
+    assert any(
+        "Holdout takeaway." in str(element.value)
+        for element in app.markdown
+    )

@@ -1125,6 +1125,18 @@ def predictive_tests(features, target):
         rows.append({"Feature": col, "Obs": len(frame), "Corr": corr, "Beta": beta, "T-stat": t_stat})
     return pd.DataFrame(rows).set_index("Feature").sort_values("T-stat", key=lambda s: s.abs(), ascending=False)
 
+
+def active_macro_session_mask(returns):
+    """Identify dates where at least one contemporaneous macro market moved."""
+    macro_moves = [
+        "NASDAQ_ret",
+        "DXY_ret",
+        "GOLD_ret",
+        "OIL_ret",
+        "REAL_YIELD_chg",
+    ]
+    return returns[macro_moves].abs().gt(1e-12).any(axis=1)
+
 # ─────────────────────────────────────────────
 # FEATURE ENGINEERING
 # ─────────────────────────────────────────────
@@ -1158,8 +1170,12 @@ def build_analysis(data, transaction_cost_bps, collect_timings=False):
             "DXY_lag1",
             "REAL_YIELD_lag1",
         ]
-        X = returns[features]
-        y = returns["BTC_ret"]
+        active_returns = returns.loc[active_macro_session_mask(returns)]
+        if len(active_returns) < 20:
+            raise ValueError("Insufficient active macro sessions for same-day attribution.")
+
+        X = active_returns[features]
+        y = active_returns["BTC_ret"]
 
     with timed("same_day_models", timings):
         linreg = LinearRegression().fit(X, y)
@@ -1267,6 +1283,7 @@ def build_analysis(data, transaction_cost_bps, collect_timings=False):
         "coeffs": coeffs,
         "importance": importance,
         "contrib": contrib,
+        "attribution_date": latest.name,
         "pred": pred,
         "actual": actual,
         "narrative": narrative,
@@ -1293,6 +1310,7 @@ returns = analysis["returns"]
 coeffs = analysis["coeffs"]
 importance = analysis["importance"]
 contrib = analysis["contrib"]
+attribution_date = analysis["attribution_date"]
 pred = analysis["pred"]
 actual = analysis["actual"]
 narrative = analysis["narrative"]
@@ -1393,7 +1411,11 @@ st.dataframe(coeffs.sort_values(ascending=False).rename("Coefficient"))
 st.subheader("🌲 Feature Importance (Random Forest)")
 st.dataframe(importance.sort_values(ascending=False).rename("Importance"))
 
-st.subheader("📌 Driver Attribution (today)")
+st.subheader("📌 Driver Attribution (latest active macro session)")
+st.caption(
+    f"Feature date {pd.Timestamp(attribution_date):%Y-%m-%d}. "
+    "Weekends and market holidays are excluded from same-day attribution."
+)
 st.dataframe(contrib.sort_values(ascending=False).rename("Contribution"))
 
 col3, col4 = st.columns(2)

@@ -27,3 +27,5 @@ All notable changes to this project will be documented here.
 - Old complete caches are no longer presented as current live signals.
 - Streamlit cold starts retain `REAL_YIELD` through a bundled official seed
   when FRED and Treasury are temporarily unavailable.
+- Same-day driver attribution excludes forward-filled weekends and market
+  holidays, and reports the latest active macro-session date.
